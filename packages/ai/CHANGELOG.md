@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed fresh Codex plan-execution turns that contain only hidden developer guidance by mirroring the final instruction as user input on the wire, preventing Codex `response.create` from rejecting the request as missing `input`.
+
 ## [16.3.10] - 2026-07-06
 
 ### Fixed

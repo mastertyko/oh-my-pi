@@ -26,6 +26,9 @@ function createCodexTestContext(): Context {
 		messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
 	};
 }
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return Boolean(value) && typeof value === "object";
+}
 
 function createCodexSse(events: Array<Record<string, unknown>>): string {
 	return `${events.map(event => `data: ${JSON.stringify(event)}`).join("\n\n")}\n\n`;
@@ -266,6 +269,41 @@ describe("openai-codex Responses Lite input shaping", () => {
 
 		const noTools = await transformRequestBody({ model: model.id }, model, { responsesLite: true });
 		expect(noTools.parallel_tool_calls).toBeUndefined();
+	});
+
+	it("adds a user continuation when the request would otherwise contain only developer guidance", async () => {
+		const model = createCodexModel("gpt-5.5");
+		const directive = "Read local://approved-plan.md, then execute it.";
+
+		const payload = await transformRequestBody(
+			{ model: model.id, input: [] },
+			model,
+			{ responsesLite: true },
+			{ developerMessages: [directive] },
+		);
+
+		const input = payload.input ?? [];
+		expect(input).toEqual(
+			expect.arrayContaining([expect.objectContaining({ role: "developer" }), expect.objectContaining({ role: "user" })]),
+		);
+		expect(input.find(item => item.role === "developer")).toMatchObject({
+			role: "developer",
+			content: [{ type: "input_text", text: directive }],
+		});
+		expect(
+			input.some(
+				item =>
+					item.role === "user" &&
+					Array.isArray(item.content) &&
+					item.content.some(
+						part =>
+							isRecord(part) &&
+							part.type === "input_text" &&
+							typeof part.text === "string" &&
+							part.text.trim().length > 0,
+					),
+			),
+		).toBe(true);
 	});
 });
 

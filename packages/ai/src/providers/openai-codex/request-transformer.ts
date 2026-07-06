@@ -214,6 +214,35 @@ function stripImageDetails(input: InputItem[]): void {
 	}
 }
 
+/** Codex treats developer/system-only `response.create` input as no prompt at
+ *  all. Fresh plan-approval execution can start with hidden developer guidance
+ *  only, so preserve those instruction items and mirror the final instruction as
+ *  a user message on the wire. Mixed user/tool transcripts keep their roles. */
+function ensureCodexActionableInput(input: InputItem[] | undefined): InputItem[] | undefined {
+	if (!input || input.length === 0) return input;
+	let userContent: unknown;
+	for (const item of input) {
+		if (!item) continue;
+		const role = typeof item.role === "string" ? item.role.toLowerCase() : undefined;
+		const instructionOnly = role === "developer" || role === "system";
+		if (!instructionOnly) return input;
+		if (item.content !== undefined) {
+			userContent = Array.isArray(item.content)
+				? item.content.map(part => (part && typeof part === "object" ? { ...part } : part))
+				: item.content;
+		}
+	}
+	if (userContent === undefined) return input;
+	return [
+		...input,
+		{
+			type: "message",
+			role: "user",
+			content: userContent,
+		},
+	];
+}
+
 export async function transformRequestBody(
 	body: RequestBody,
 	model: Model<Api>,
@@ -241,6 +270,7 @@ export async function transformRequestBody(
 		);
 		body.input = [...developerMessages, ...body.input];
 	}
+	body.input = ensureCodexActionableInput(body.input);
 
 	const responsesLite = shouldUseCodexResponsesLite(body, options.responsesLite);
 	if (responsesLite) {
