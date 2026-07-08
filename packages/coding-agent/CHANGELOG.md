@@ -129,6 +129,9 @@
 - Fixed retry fallback model recovery by exposing `retry.fallbackChains` in `/settings`, adding a `/model` action to assign the selected default fallback model, and clearing a selected model's retry cooldown marker on manual model switches. ([#4533](https://github.com/can1357/oh-my-pi/issues/4533))
 - Fixed `/handoff` and auto-handoff skipping extension lifecycle hooks by emitting cancellable `session_before_switch` hooks and a `session_switch` with `reason: "handoff"` after the replacement session is ready ([#4434](https://github.com/can1357/oh-my-pi/issues/4434)).
 - Fixed TTSR stream interrupts so only the tool call whose stream matched a rule receives the rule-named abort result; sibling tool-call placeholders now use a neutral abort reason ([#2783](https://github.com/can1357/oh-my-pi/issues/2783)).
+### Fixed
+
+- Fixed agent-authored summary/continuation turns repeating a completed answer by hiding autolearn capture output, preserving idle advisor concerns without waking a new primary turn, and skipping post-compaction auto-continue when the compacted tail is already a terminal text answer.
 
 ## [16.3.11] - 2026-07-06
 
