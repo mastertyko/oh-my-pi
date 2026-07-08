@@ -3137,7 +3137,13 @@ describe("openai-codex streaming", () => {
 			lastPreviousResponseId: undefined,
 		});
 	});
-	it("retries websocket continuations when a proxy reports a stale previous response anchor", async () => {
+	it.each([
+		[
+			"codex_previous_response_stale",
+			"Upstream previous response anchor expired; retry without previous_response_id.",
+		],
+		["continuity_fail_closed", "Upstream rejected the continuation anchor."],
+	] as const)("retries websocket continuations when a proxy reports %s", async (errorCode, errorMessage) => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
 		const token = createCodexTestToken();
@@ -3172,8 +3178,8 @@ describe("openai-codex streaming", () => {
 					expect(request.previous_response_id).toBe("resp_1");
 					this.sendJson({
 						type: "error",
-						code: "codex_previous_response_stale",
-						message: "Upstream previous response anchor expired; retry without previous_response_id.",
+						code: errorCode,
+						message: errorMessage,
 					});
 					return;
 				}

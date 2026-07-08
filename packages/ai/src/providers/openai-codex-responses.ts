@@ -1606,6 +1606,7 @@ const CODEX_STALE_PREVIOUS_RESPONSE_CODES: Record<string, true> = {
 	// Proxy-specific: upstream response anchor expired. Same recovery class —
 	// retry the turn with full context and no `previous_response_id`.
 	codex_previous_response_stale: true,
+	continuity_fail_closed: true,
 };
 
 function isCodexStalePreviousResponseError(error: unknown): boolean {
@@ -1613,7 +1614,7 @@ function isCodexStalePreviousResponseError(error: unknown): boolean {
 	if (
 		"code" in error &&
 		typeof error.code === "string" &&
-		Object.hasOwn(CODEX_STALE_PREVIOUS_RESPONSE_CODES, error.code)
+		Object.hasOwn(CODEX_STALE_PREVIOUS_RESPONSE_CODES, error.code.toLowerCase())
 	) {
 		return true;
 	}

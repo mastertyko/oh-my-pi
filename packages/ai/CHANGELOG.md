@@ -15,6 +15,9 @@
 ### Changed
 
 - Enforced `all_turns` reasoning context for all Responses Lite requests
+### Fixed
+
+- Fixed Codex WebSocket continuation recovery to retry with full context when codex-lb reports stale anchor codes such as `codex_previous_response_stale` or `continuity_fail_closed`.
 
 ## [16.4.0] - 2026-07-10
 
