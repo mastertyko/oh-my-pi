@@ -2646,10 +2646,6 @@ export class AgentSession {
 			aborting: this.#abortInProgress,
 			interruptImmuneTurnActive: interrupting && this.#isAdvisorInterruptImmuneTurnActive(),
 		});
-		if (channel === "aside") {
-			this.yieldQueue.enqueue("advisor", { note, severity, advisor: source });
-			return;
-		}
 		const notes: AdvisorNote[] = [{ note, severity, advisor: source }];
 		const content = formatAdvisorBatchContent(notes);
 		const details = { notes } satisfies AdvisorMessageDetails;
@@ -2666,14 +2662,19 @@ export class AgentSession {
 			this.#preserveAdvisorCard(card);
 			return;
 		}
+		if (this.#isIdleTerminalTextAnswer()) {
+			if (channel === "steer") this.#recordAdvisorInterruptDelivered();
+			this.#preserveAdvisorCard(card);
+			return;
+		}
+		if (channel === "aside") {
+			this.yieldQueue.enqueue("advisor", { note, severity, advisor: source });
+			return;
+		}
 		if (this.#planModeState?.enabled) {
 			// Plan mode: record advice visibly in context but never wake an
 			// autonomous turn — only user-driven turns converge on ask/resolve.
 			this.#recordAdvisorInterruptDelivered();
-			this.#preserveAdvisorCard(card);
-			return;
-		}
-		if (!this.agent.state.isStreaming && this.#isIdleTerminalTextAnswer()) {
 			this.#preserveAdvisorCard(card);
 			return;
 		}

@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Fixed agent-authored summary/continuation turns repeating a completed answer by hiding autolearn capture output, preserving idle advisor concerns without waking a new primary turn, and skipping post-compaction auto-continue when the compacted tail is already a terminal text answer.
+- Fixed agent-authored summary/continuation turns repeating a completed answer by hiding autolearn capture output, preserving idle advisor concerns and nits without waking a new primary turn, and skipping post-compaction auto-continue when the compacted tail is already a terminal text answer.
 
 ## [16.3.11] - 2026-07-06
 
