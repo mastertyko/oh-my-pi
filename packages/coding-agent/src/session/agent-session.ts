@@ -1794,7 +1794,9 @@ export class AgentSession {
 	// checks in #handleAgentEvent) still fire on the original schedule — only the
 	// `#emit(event)` that reaches external subscribers (rpc-mode stdout, ACP bridge,
 	// Cursor exec, TUI listeners) is held back. Without this, a client that resumes
-	// on `agent_end` can fire its next `prompt` before #promptWithMessage's finally
+	// on `agent_end` can fire its next `prompt` before #promptWithMessage's finally returns.
+	/** Base active-context length while an autolearn capture turn runs hidden. */
+	#autolearnCaptureTurnBaseMessageCount: number | undefined;
 	#emptyStopRetryCount = 0;
 	#unexpectedStopRetryCount = 0;
 	#promptGeneration = 0;
@@ -2005,6 +2007,23 @@ export class AgentSession {
 		}
 		this.agent.emitExternalEvent({ type: "message_start", message: card });
 		this.agent.emitExternalEvent({ type: "message_end", message: card });
+	}
+
+	#isAutolearnCaptureTurn(message: Pick<CustomMessage, "customType">): boolean {
+		return message.customType === "autolearn-nudge";
+	}
+
+	#isAutolearnCaptureTurnEvent(event: AgentEvent): boolean {
+		return this.#autolearnCaptureTurnBaseMessageCount !== undefined && event.type !== "agent_end";
+	}
+
+	#restoreAutolearnCaptureTurnMessages(): void {
+		const baseMessageCount = this.#autolearnCaptureTurnBaseMessageCount;
+		if (baseMessageCount === undefined) return;
+		this.#autolearnCaptureTurnBaseMessageCount = undefined;
+		const messages = this.agent.state.messages;
+		if (messages.length <= baseMessageCount) return;
+		this.agent.replaceMessages(messages.slice(0, baseMessageCount));
 	}
 
 	#resetInFlight(): void {
@@ -2634,33 +2653,31 @@ export class AgentSession {
 		const notes: AdvisorNote[] = [{ note, severity, advisor: source }];
 		const content = formatAdvisorBatchContent(notes);
 		const details = { notes } satisfies AdvisorMessageDetails;
+		const card: CustomMessage = {
+			role: "custom",
+			customType: "advisor",
+			content,
+			display: true,
+			attribution: "agent",
+			details,
+			timestamp: Date.now(),
+		};
 		if (channel === "preserve") {
-			this.#preserveAdvisorCard({
-				role: "custom",
-				customType: "advisor",
-				content,
-				display: true,
-				attribution: "agent",
-				details,
-				timestamp: Date.now(),
-			});
+			this.#preserveAdvisorCard(card);
 			return;
 		}
-		this.#recordAdvisorInterruptDelivered();
 		if (this.#planModeState?.enabled) {
 			// Plan mode: record advice visibly in context but never wake an
 			// autonomous turn — only user-driven turns converge on ask/resolve.
-			this.#preserveAdvisorCard({
-				role: "custom",
-				customType: "advisor",
-				content,
-				display: true,
-				attribution: "agent",
-				details,
-				timestamp: Date.now(),
-			});
+			this.#recordAdvisorInterruptDelivered();
+			this.#preserveAdvisorCard(card);
 			return;
 		}
+		if (!this.agent.state.isStreaming && this.#isIdleTerminalTextAnswer()) {
+			this.#preserveAdvisorCard(card);
+			return;
+		}
+		this.#recordAdvisorInterruptDelivered();
 		void this.sendCustomMessage(
 			{ customType: "advisor", content, display: true, attribution: "agent", details },
 			{ deliverAs: "steer", triggerTurn: true },
@@ -3501,6 +3518,8 @@ export class AgentSession {
 	}
 
 	#processAgentEvent = async (event: AgentEvent): Promise<void> => {
+		const suppressAutolearnCaptureTurnEvent = this.#isAutolearnCaptureTurnEvent(event);
+		if (suppressAutolearnCaptureTurnEvent) return;
 		// Step the mid-run todo counter synchronously, BEFORE any await in this
 		// handler. The agent loop's next-turn `getAsideMessages` poll can run
 		// before queued microtasks drain, so `#takeMidRunTodoNudge` MUST see the
@@ -3557,8 +3576,7 @@ export class AgentSession {
 			this.agent.appendMessage(interruptedThinkingMessage);
 		}
 
-		const messageEndPersistence =
-			event.type === "message_end" ? this.#createMessageEndPersistenceSlot(event.message) : undefined;
+		const messageEndPersistence = event.type === "message_end" ? this.#createMessageEndPersistenceSlot(event.message) : undefined;
 
 		// Deobfuscate assistant message content for display emission — the LLM echoes back
 		// obfuscated placeholders, but listeners (TUI, extensions, exporters) must see real
@@ -3841,9 +3859,16 @@ export class AgentSession {
 		// Check auto-retry and auto-compaction after agent completes
 		if (event.type === "agent_end") {
 			const settledMessages = this.agent.state.messages;
-			const emitAgentEndNotification = async () => {
-				await this.#emitAgentEndNotification(settledMessages);
+			const emitAgentEndNotification = async (messages = settledMessages) => {
+				await this.#emitAgentEndNotification(messages);
 			};
+			if (this.#autolearnCaptureTurnBaseMessageCount !== undefined) {
+				this.#restoreAutolearnCaptureTurnMessages();
+				this.#lastAssistantMessage = undefined;
+				this.#lastSuccessfulYieldToolCallId = undefined;
+				await emitAgentEndNotification(this.agent.state.messages);
+				return;
+			}
 			const usage = this.getSessionStats().tokens;
 			await this.#goalRuntime.onAgentEnd({
 				currentUsage: {
@@ -4204,7 +4229,8 @@ export class AgentSession {
 		);
 	}
 
-	#scheduleAutoContinuePrompt(generation: number): void {
+	#scheduleAutoContinuePrompt(generation: number): boolean {
+		if (this.#isIdleTerminalTextAnswer()) return false;
 		const continuePrompt = async () => {
 			// Compaction summarizes away the first-message eager preludes, so re-assert the
 			// delegate-via-tasks / phased-todo reminders on this auto-resumed turn. This runs
@@ -4233,6 +4259,7 @@ export class AgentSession {
 			},
 			{ generation },
 		);
+		return true;
 	}
 
 	async #cancelPostPromptTasks(): Promise<void> {
@@ -4807,6 +4834,15 @@ export class AgentSession {
 			}
 		}
 		return undefined;
+	}
+
+	#isIdleTerminalTextAnswer(): boolean {
+		if (this.agent.hasQueuedMessages()) return false;
+		if (this.#goalModeState?.enabled === true && this.#goalModeState.goal.status === "active") return false;
+		const assistant = this.#findLastAssistantMessage();
+		if (!assistant || assistant.stopReason !== "stop") return false;
+		if (assistant.content.some(content => content.type === "toolCall")) return false;
+		return hasNonWhitespace(textFromContent(assistant.content));
 	}
 
 	#resetStreamingEditState(): void {
@@ -8112,10 +8148,15 @@ export class AgentSession {
 
 	async #promptAgentInitiatedMessage(message: CustomMessage): Promise<void> {
 		this.#beginInFlight();
+		const suppressAutolearnCaptureTurn = this.#isAutolearnCaptureTurn(message);
+		if (suppressAutolearnCaptureTurn) {
+			this.#autolearnCaptureTurnBaseMessageCount = this.agent.state.messages.length;
+		}
 		try {
 			await this.agent.prompt(message);
 			await this.#waitForPostPromptRecovery();
 		} finally {
+			if (suppressAutolearnCaptureTurn) this.#restoreAutolearnCaptureTurnMessages();
 			this.#endInFlight();
 		}
 	}
@@ -12343,10 +12384,11 @@ export class AgentSession {
 						aborted: false,
 						willRetry: false,
 					});
-					const continuationScheduled = !autoCompactionSignal.aborted && reason !== "idle" && shouldAutoContinue;
-					if (continuationScheduled) {
+					const continuationScheduled =
+						!autoCompactionSignal.aborted &&
+						reason !== "idle" &&
+						shouldAutoContinue &&
 						this.#scheduleAutoContinuePrompt(generation);
-					}
 					return {
 						...(continuationScheduled ? COMPACTION_CHECK_CONTINUATION : COMPACTION_CHECK_NONE),
 						historyRewritten: true,
@@ -12801,8 +12843,7 @@ export class AgentSession {
 					}
 				}
 				if (hasHeadroom) {
-					if (shouldAutoContinue) {
-						this.#scheduleAutoContinuePrompt(generation);
+					if (shouldAutoContinue && this.#scheduleAutoContinuePrompt(generation)) {
 						continuationScheduled = true;
 					}
 				} else {
@@ -12960,8 +13001,7 @@ export class AgentSession {
 			});
 
 			let continuationScheduled = false;
-			if (!willRetry && reason !== "idle" && autoContinue) {
-				this.#scheduleAutoContinuePrompt(generation);
+			if (!willRetry && reason !== "idle" && autoContinue && this.#scheduleAutoContinuePrompt(generation)) {
 				continuationScheduled = true;
 			}
 			if (willRetry) {
