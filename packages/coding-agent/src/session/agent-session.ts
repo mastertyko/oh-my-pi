@@ -2720,10 +2720,6 @@ export class AgentSession {
 			aborting: this.#abortInProgress,
 			interruptImmuneTurnActive: interrupting && this.#isAdvisorInterruptImmuneTurnActive(),
 		});
-		if (channel === "aside") {
-			this.yieldQueue.enqueue("advisor", { note, severity, advisor: source });
-			return;
-		}
 		const notes: AdvisorNote[] = [{ note, severity, advisor: source }];
 		const content = formatAdvisorBatchContent(notes);
 		const details = { notes } satisfies AdvisorMessageDetails;
@@ -2740,14 +2736,19 @@ export class AgentSession {
 			this.#preserveAdvisorCard(card);
 			return;
 		}
+		if (this.#isIdleTerminalTextAnswer()) {
+			if (channel === "steer") this.#recordAdvisorInterruptDelivered();
+			this.#preserveAdvisorCard(card);
+			return;
+		}
+		if (channel === "aside") {
+			this.yieldQueue.enqueue("advisor", { note, severity, advisor: source });
+			return;
+		}
 		if (this.#planModeState?.enabled) {
 			// Plan mode: record advice visibly in context but never wake an
 			// autonomous turn — only user-driven turns converge on ask/resolve.
 			this.#recordAdvisorInterruptDelivered();
-			this.#preserveAdvisorCard(card);
-			return;
-		}
-		if (!this.agent.state.isStreaming && this.#isIdleTerminalTextAnswer()) {
 			this.#preserveAdvisorCard(card);
 			return;
 		}
@@ -3662,7 +3663,8 @@ export class AgentSession {
 			this.agent.appendMessage(interruptedThinkingMessage);
 		}
 
-		const messageEndPersistence = event.type === "message_end" ? this.#createMessageEndPersistenceSlot(event.message) : undefined;
+		const messageEndPersistence =
+			event.type === "message_end" ? this.#createMessageEndPersistenceSlot(event.message) : undefined;
 
 		// Deobfuscate assistant message content for display emission — the LLM echoes back
 		// obfuscated placeholders, but listeners (TUI, extensions, exporters) must see real
@@ -4954,7 +4956,7 @@ export class AgentSession {
 		if (this.agent.hasQueuedMessages()) return false;
 		if (this.#goalModeState?.enabled === true && this.#goalModeState.goal.status === "active") return false;
 		const assistant = this.#findLastAssistantMessage();
-		if (!assistant || assistant.stopReason !== "stop") return false;
+		if (assistant?.stopReason !== "stop") return false;
 		if (assistant.content.some(content => content.type === "toolCall")) return false;
 		return hasNonWhitespace(textFromContent(assistant.content));
 	}

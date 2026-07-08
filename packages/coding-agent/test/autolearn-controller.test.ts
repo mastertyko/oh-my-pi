@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { AutoLearnController, buildAutoLearnInstructions } from "@oh-my-pi/pi-coding-agent/autolearn/controller";
-import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { createMockModel, type MockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { AutoLearnController, buildAutoLearnInstructions } from "@oh-my-pi/pi-coding-agent/autolearn/controller";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -346,18 +346,23 @@ it("hides capture-turn assistant text while still clearing suppression on its ag
 	expect(mock.calls).toHaveLength(1);
 	expect(agentEnds).toBe(2);
 	expect(
-		session.messages.filter(message => message.role === "assistant" && messageText(message) === "First real answer").length,
+		session.messages.filter(message => message.role === "assistant" && messageText(message) === "First real answer")
+			.length,
 	).toBe(1);
 	expect(
-		session.buildDisplaySessionContext().messages.filter(
-			message => message.role === "assistant" && messageText(message) === "First real answer",
-		).length,
+		session
+			.buildDisplaySessionContext()
+			.messages.filter(message => message.role === "assistant" && messageText(message) === "First real answer")
+			.length,
 	).toBe(1);
 	expect(
 		sessionManager
 			.getBranch()
 			.filter(
-				entry => entry.type === "message" && entry.message.role === "assistant" && messageText(entry.message) === "First real answer",
+				entry =>
+					entry.type === "message" &&
+					entry.message.role === "assistant" &&
+					messageText(entry.message) === "First real answer",
 			).length,
 	).toBe(1);
 
@@ -377,18 +382,23 @@ it("hides capture-turn assistant text while still clearing suppression on its ag
 	expect(mock.calls).toHaveLength(2);
 	expect(agentEnds).toBe(4);
 	expect(
-		session.messages.filter(message => message.role === "assistant" && messageText(message) === "Second real answer").length,
+		session.messages.filter(message => message.role === "assistant" && messageText(message) === "Second real answer")
+			.length,
 	).toBe(1);
 	expect(
-		session.buildDisplaySessionContext().messages.filter(
-			message => message.role === "assistant" && messageText(message) === "Second real answer",
-		).length,
+		session
+			.buildDisplaySessionContext()
+			.messages.filter(message => message.role === "assistant" && messageText(message) === "Second real answer")
+			.length,
 	).toBe(1);
 	expect(
 		sessionManager
 			.getBranch()
 			.filter(
-				entry => entry.type === "message" && entry.message.role === "assistant" && messageText(entry.message) === "Second real answer",
+				entry =>
+					entry.type === "message" &&
+					entry.message.role === "assistant" &&
+					messageText(entry.message) === "Second real answer",
 			).length,
 	).toBe(1);
 });

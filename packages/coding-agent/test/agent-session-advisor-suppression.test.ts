@@ -345,6 +345,55 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		expect(advisorMock.calls.length).toBeGreaterThanOrEqual(1);
 	});
 
+	it("preserves an idle advisor nit after a terminal text stop, without waking a new primary turn", async () => {
+		const { session, sessionManager, mock, advisorMock } = await createIdleAdvisorSession([
+			{
+				content: [
+					{
+						type: "toolCall",
+						name: "advise",
+						arguments: { note: "tighten the wording", severity: "nit" },
+					},
+				],
+			},
+		]);
+		const persisted = capturePersistedAdvice(sessionManager);
+		const finalAssistant = {
+			role: "assistant" as const,
+			content: [{ type: "text" as const, text: "finished cleanly" }],
+			api: "anthropic-messages" as const,
+			provider: "anthropic" as const,
+			model: "claude-sonnet-4-5",
+			stopReason: "stop" as const,
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+		session.agent.emitExternalEvent({ type: "message_end", message: finalAssistant });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [finalAssistant] });
+		await session.waitForIdle();
+		expect(mock.calls.length).toBe(0);
+
+		session.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
+		expect(session.setAdvisorEnabled(true)).toBe(true);
+		const advisor = session.getAdvisorAgent();
+		if (!advisor) throw new Error("Expected advisor agent to be live");
+		await advisor.prompt("inspect current turn").catch(() => {});
+		await session.waitForIdle();
+
+		expect(session.agent.state.messages.filter(isAdvisorCard)).toHaveLength(1);
+		expect(persisted).toHaveLength(1);
+		expect(persisted[0]).toContain("tighten the wording");
+		expect(mock.calls.length).toBe(0);
+		expect(advisorMock.calls.length).toBeGreaterThanOrEqual(1);
+	});
+
 	it("reclaims a stranded advisor steer on settle while suppressed, instead of auto-resuming the stopped run", async () => {
 		// Residual edge exposed once interrupting advice is steered (not parked) into a
 		// resumed streaming run: a concern can land in the steer queue past the loop's
