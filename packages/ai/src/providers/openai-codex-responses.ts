@@ -180,6 +180,11 @@ const CODEX_WEBSOCKET_RETRY_BUDGET = Number($env.PI_CODEX_WEBSOCKET_RETRY_BUDGET
 const CODEX_WEBSOCKET_RETRY_DELAY_MS = Number($env.PI_CODEX_WEBSOCKET_RETRY_DELAY_MS || CODEX_RETRY_DELAY_MS);
 const CODEX_WEBSOCKET_TRANSPORT_ERROR_PREFIX = "Codex websocket transport error";
 const CODEX_RETRYABLE_EVENT_CODES = new Set(["model_error", "server_error", "internal_error"]);
+const CODEX_STALE_PREVIOUS_RESPONSE_CODES: Record<string, true> = {
+	previous_response_not_found: true,
+	codex_previous_response_stale: true,
+	continuity_fail_closed: true,
+};
 const CODEX_RETRYABLE_EVENT_MESSAGE =
 	/processing your request|retry your request|temporar(?:y|ily)|overloaded|service.?unavailable|internal error|server error/i;
 const CODEX_PROVIDER_SESSION_STATE_KEY = "openai-codex-responses";
@@ -1233,9 +1238,12 @@ function getOutputBlockStartEventType(block: CodexOutputBlock): "thinking_start"
 }
 
 function isCodexStalePreviousResponseError(error: unknown): boolean {
-	if (error instanceof CodexProviderStreamError) return error.code === "previous_response_not_found";
+	if (error instanceof CodexProviderStreamError) {
+		return error.code !== undefined && CODEX_STALE_PREVIOUS_RESPONSE_CODES[error.code.toLowerCase()] === true;
+	}
 	if (!(error instanceof Error)) return false;
-	if ((error as { code?: string }).code === "previous_response_not_found") return true;
+	const { code } = error as Error & { code?: string };
+	if (code !== undefined && CODEX_STALE_PREVIOUS_RESPONSE_CODES[code.toLowerCase()] === true) return true;
 	// "unsupported": the backend intermittently rejects the parameter outright
 	// with `{"detail":"Unsupported parameter: previous_response_id"}` (no
 	// `error.code`); treat it like a stale chain so the turn replays with full
