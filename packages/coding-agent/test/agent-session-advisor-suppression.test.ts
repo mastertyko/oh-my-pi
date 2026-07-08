@@ -41,6 +41,13 @@ interface ParkedHarness {
 	streamStarted: Promise<void>;
 }
 
+interface IdleAdvisorHarness {
+	session: AgentSession;
+	sessionManager: SessionManager;
+	mock: MockModel;
+	advisorMock: MockModel;
+}
+
 describe("AgentSession advisor auto-resume suppression", () => {
 	let tempDir: TempDir;
 	let session: AgentSession;
@@ -92,6 +99,32 @@ describe("AgentSession advisor auto-resume suppression", () => {
 		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
 		session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
 		return { session, sessionManager, mock, streamStarted: started.promise };
+	}
+
+	async function createIdleAdvisorSession(advisorResponses: MockResponse[]): Promise<IdleAdvisorHarness> {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ responses: [] });
+		const advisorMock = createMockModel({ responses: advisorResponses });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: mock.stream,
+		});
+		const sessionManager = SessionManager.inMemory();
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		const authStorage = await AuthStorage.create(tempDir.join(`auth-${Snowflake.next()}.db`));
+		authStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage, tempDir.join(`models-${Snowflake.next()}.yml`));
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+			advisorTools: [],
+			advisorStreamFn: advisorMock.stream,
+		});
+		return { session, sessionManager, mock, advisorMock };
 	}
 
 	function advisorCard(content: string) {
@@ -197,6 +230,56 @@ describe("AgentSession advisor auto-resume suppression", () => {
 
 		expect(session.agent.peekSteeringQueue()).toEqual([]);
 		expect(mock.calls.length).toBe(2);
+	});
+
+	it("preserves an idle interrupting advisor note after a terminal text stop, without waking a new primary turn", async () => {
+		const { session, sessionManager, mock, advisorMock } = await createIdleAdvisorSession([
+			{
+				content: [
+					{
+						type: "toolCall",
+						name: "advise",
+						arguments: { note: "double-check the migration", severity: "concern" },
+					},
+				],
+			},
+		]);
+		const persisted = capturePersistedAdvice(sessionManager);
+		const finalAssistant = {
+			role: "assistant" as const,
+			content: [{ type: "text" as const, text: "finished cleanly" }],
+			api: "anthropic-messages" as const,
+			provider: "anthropic" as const,
+			model: "claude-sonnet-4-5",
+			stopReason: "stop" as const,
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+		session.agent.emitExternalEvent({ type: "message_end", message: finalAssistant });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [finalAssistant] });
+		await session.waitForIdle();
+		expect(mock.calls.length).toBe(0);
+
+		session.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
+		expect(session.setAdvisorEnabled(true)).toBe(true);
+		const advisor = session.getAdvisorAgent();
+		if (!advisor) throw new Error("Expected advisor agent to be live");
+		await advisor.prompt("inspect current turn").catch(() => {});
+		await session.waitForIdle();
+
+		expect(session.agent.state.messages.filter(isAdvisorCard)).toHaveLength(1);
+		expect(persisted).toHaveLength(1);
+		expect(persisted[0]).toContain("double-check the migration");
+		expect(session.agent.peekSteeringQueue()).toEqual([]);
+		expect(mock.calls.length).toBe(0);
+		expect(advisorMock.calls.length).toBeGreaterThanOrEqual(1);
 	});
 
 	it("reclaims a stranded advisor steer on settle while suppressed, instead of auto-resuming the stopped run", async () => {

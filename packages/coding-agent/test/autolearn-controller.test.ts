@@ -1,7 +1,15 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import { AutoLearnController, buildAutoLearnInstructions } from "@oh-my-pi/pi-coding-agent/autolearn/controller";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { Agent } from "@oh-my-pi/pi-agent-core";
+import { createMockModel, type MockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { TempDir } from "@oh-my-pi/pi-utils";
+import { createAssistantMessage } from "./helpers/agent-session-setup";
 
 interface CapturedNudge {
 	message: { customType: string; content: string; display?: boolean; attribution?: string };
@@ -61,6 +69,68 @@ function install(session: FakeSession, overrides: Record<string, unknown> = {}):
 	const settings = Settings.isolated({ "autolearn.enabled": true, ...overrides });
 	new AutoLearnController({ session: session as unknown as AgentSession, settings });
 	return settings;
+}
+
+interface AutoLearnSessionHarness {
+	session: AgentSession;
+	sessionManager: SessionManager;
+	mock: MockModel;
+	authStorage: AuthStorage;
+	tempDir: TempDir;
+}
+
+const autoLearnHarnesses: AutoLearnSessionHarness[] = [];
+
+afterEach(async () => {
+	for (const harness of autoLearnHarnesses.splice(0)) {
+		await harness.session.dispose();
+		harness.authStorage.close();
+		await harness.tempDir.remove();
+	}
+});
+
+function messageText(message: { content?: unknown }): string {
+	const content = message.content;
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	const parts: string[] = [];
+	for (const block of content) {
+		if (typeof block !== "object" || block === null) continue;
+		if (!("type" in block) || !("text" in block)) continue;
+		if (block.type === "text" && typeof block.text === "string") parts.push(block.text);
+	}
+	return parts.join("\n");
+}
+
+async function createAutoLearnSessionHarness(responses: MockResponse[]): Promise<AutoLearnSessionHarness> {
+	const tempDir = TempDir.createSync("@pi-autolearn-capture-");
+	const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+	authStorage.setRuntimeApiKey("anthropic", "test-key");
+	const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+	if (!model) throw new Error("Expected bundled anthropic model to exist");
+	const mock = createMockModel({ responses });
+	const sessionManager = SessionManager.inMemory();
+	const settings = Settings.isolated({
+		"autolearn.enabled": true,
+		"autolearn.autoContinue": true,
+		"compaction.enabled": false,
+		"retry.enabled": false,
+	});
+	const session = new AgentSession({
+		agent: new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: mock.stream,
+		}),
+		sessionManager,
+		settings,
+		modelRegistry,
+	});
+	new AutoLearnController({ session, settings });
+	const harness = { session, sessionManager, mock, authStorage, tempDir };
+	autoLearnHarnesses.push(harness);
+	return harness;
 }
 
 describe("AutoLearnController", () => {
@@ -248,6 +318,79 @@ describe("AutoLearnController", () => {
 		session.agentEnd();
 		expect(session.sent).toHaveLength(1);
 	});
+});
+
+it("hides capture-turn assistant text while still clearing suppression on its agent_end", async () => {
+	const { session, sessionManager, mock } = await createAutoLearnSessionHarness([
+		{ content: ["First real answer"] },
+		{ content: ["Second real answer"] },
+	]);
+	let agentEnds = 0;
+	session.subscribe(event => {
+		if (event.type === "agent_end") agentEnds++;
+	});
+
+	for (let i = 0; i < 5; i++) {
+		session.agent.emitExternalEvent({
+			type: "tool_execution_end",
+			toolCallId: `first-${i}`,
+			toolName: "read",
+			result: null,
+		});
+	}
+	const firstRealAnswer = createAssistantMessage("First real answer");
+	session.agent.emitExternalEvent({ type: "message_end", message: firstRealAnswer });
+	session.agent.emitExternalEvent({ type: "agent_end", messages: [firstRealAnswer] });
+	await session.waitForIdle();
+
+	expect(mock.calls).toHaveLength(1);
+	expect(agentEnds).toBe(2);
+	expect(
+		session.messages.filter(message => message.role === "assistant" && messageText(message) === "First real answer").length,
+	).toBe(1);
+	expect(
+		session.buildDisplaySessionContext().messages.filter(
+			message => message.role === "assistant" && messageText(message) === "First real answer",
+		).length,
+	).toBe(1);
+	expect(
+		sessionManager
+			.getBranch()
+			.filter(
+				entry => entry.type === "message" && entry.message.role === "assistant" && messageText(entry.message) === "First real answer",
+			).length,
+	).toBe(1);
+
+	for (let i = 0; i < 5; i++) {
+		session.agent.emitExternalEvent({
+			type: "tool_execution_end",
+			toolCallId: `second-${i}`,
+			toolName: "read",
+			result: null,
+		});
+	}
+	const secondRealAnswer = createAssistantMessage("Second real answer");
+	session.agent.emitExternalEvent({ type: "message_end", message: secondRealAnswer });
+	session.agent.emitExternalEvent({ type: "agent_end", messages: [secondRealAnswer] });
+	await session.waitForIdle();
+
+	expect(mock.calls).toHaveLength(2);
+	expect(agentEnds).toBe(4);
+	expect(
+		session.messages.filter(message => message.role === "assistant" && messageText(message) === "Second real answer").length,
+	).toBe(1);
+	expect(
+		session.buildDisplaySessionContext().messages.filter(
+			message => message.role === "assistant" && messageText(message) === "Second real answer",
+		).length,
+	).toBe(1);
+	expect(
+		sessionManager
+			.getBranch()
+			.filter(
+				entry => entry.type === "message" && entry.message.role === "assistant" && messageText(entry.message) === "Second real answer",
+			).length,
+	).toBe(1);
 });
 
 describe("buildAutoLearnInstructions", () => {
