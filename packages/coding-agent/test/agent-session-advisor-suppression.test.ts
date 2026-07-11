@@ -17,10 +17,15 @@
  *     (which converts to `developer`) would send an invalid provider tail, so the
  *     follow-up stays queued for the next explicit resume rather than auto-running.
  */
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { ToolCall } from "@oh-my-pi/pi-ai";
-import { createMockModel, type MockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
+import {
+	createMockModel,
+	type MockModel,
+	type MockResponse,
+	type MockResponseSource,
+} from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -54,6 +59,13 @@ interface ParkedHarness {
 	streamStarted: Promise<void>;
 }
 
+interface IdleAdvisorHarness {
+	session: AgentSession;
+	sessionManager: SessionManager;
+	mock: MockModel;
+	advisorMock: MockModel;
+}
+
 describe("AgentSession advisor auto-resume suppression", () => {
 	let tempDir: TempDir;
 	let session: AgentSession;
@@ -64,6 +76,7 @@ describe("AgentSession advisor auto-resume suppression", () => {
 	});
 
 	afterEach(async () => {
+		vi.restoreAllMocks();
 		// dispose() aborts the agent, cancelling the parked first-turn stream.
 		try {
 			await session?.dispose();
@@ -155,6 +168,35 @@ describe("AgentSession advisor auto-resume suppression", () => {
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			},
 		};
+	}
+
+	async function createIdleAdvisorSession(
+		advisorResponses: MockResponseSource,
+		primaryResponses: MockResponseSource = [],
+	): Promise<IdleAdvisorHarness> {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ responses: primaryResponses });
+		const advisorMock = createMockModel({ responses: advisorResponses });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: mock.stream,
+		});
+		const sessionManager = SessionManager.inMemory();
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		const authStorage = await AuthStorage.create(tempDir.join(`auth-${Snowflake.next()}.db`));
+		authStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage, tempDir.join(`models-${Snowflake.next()}.yml`));
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+			advisorTools: [],
+			advisorStreamFn: advisorMock.stream,
+		});
+		return { session, sessionManager, mock, advisorMock };
 	}
 
 	function advisorCard(content: string) {
@@ -260,6 +302,283 @@ describe("AgentSession advisor auto-resume suppression", () => {
 
 		expect(session.agent.peekSteeringQueue()).toEqual([]);
 		expect(mock.calls.length).toBe(2);
+	});
+
+	it("preserves an idle interrupting advisor note after a terminal text stop, without waking a new primary turn", async () => {
+		const { session, sessionManager, mock, advisorMock } = await createIdleAdvisorSession([
+			{
+				content: [
+					{
+						type: "toolCall",
+						name: "advise",
+						arguments: { note: "double-check the migration", severity: "concern" },
+					},
+				],
+			},
+		]);
+		const persisted = capturePersistedAdvice(sessionManager);
+		const finalAssistant = {
+			role: "assistant" as const,
+			content: [{ type: "text" as const, text: "finished cleanly" }],
+			api: "anthropic-messages" as const,
+			provider: "anthropic" as const,
+			model: "claude-sonnet-4-5",
+			stopReason: "stop" as const,
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+		session.agent.emitExternalEvent({ type: "message_end", message: finalAssistant });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [finalAssistant] });
+		await session.waitForIdle();
+		expect(mock.calls.length).toBe(0);
+
+		session.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
+		expect(session.setAdvisorEnabled(true)).toBe(true);
+		const advisor = session.getAdvisorAgent();
+		if (!advisor) throw new Error("Expected advisor agent to be live");
+		await advisor.prompt("inspect current turn").catch(() => {});
+		await session.waitForIdle();
+
+		expect(session.agent.state.messages.filter(isAdvisorCard)).toHaveLength(1);
+		expect(persisted).toHaveLength(1);
+		expect(persisted[0]).toContain("double-check the migration");
+		expect(session.agent.peekSteeringQueue()).toEqual([]);
+		expect(mock.calls.length).toBe(0);
+		expect(advisorMock.calls.length).toBeGreaterThanOrEqual(1);
+	});
+
+	it("delivers advice accepted during auto-learn capture exactly once after capture teardown", async () => {
+		const { session, sessionManager, mock, advisorMock } = await createIdleAdvisorSession([
+			{
+				content: [
+					{
+						type: "toolCall",
+						name: "advise",
+						arguments: { note: "capture-time concern", severity: "concern" },
+					},
+				],
+			},
+		]);
+		const persisted = capturePersistedAdvice(sessionManager);
+		const terminalAssistant = {
+			role: "assistant" as const,
+			content: [{ type: "text" as const, text: "finished before capture" }],
+			api: "anthropic-messages" as const,
+			provider: "anthropic" as const,
+			model: "claude-sonnet-4-5",
+			stopReason: "stop" as const,
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+		session.agent.emitExternalEvent({ type: "message_end", message: terminalAssistant });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [terminalAssistant] });
+		await session.waitForIdle();
+
+		const captureStarted = Promise.withResolvers<void>();
+		const releaseCapture = Promise.withResolvers<void>();
+		const capture = session.runAutolearnCapture(async () => {
+			captureStarted.resolve();
+			await releaseCapture.promise;
+		});
+		await captureStarted.promise;
+
+		session.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
+		expect(session.setAdvisorEnabled(true)).toBe(true);
+		const advisor = session.getAdvisorAgent();
+		if (!advisor) throw new Error("Expected advisor agent to be live");
+		await advisor.prompt("inspect capture teardown").catch(() => {});
+		expect(session.agent.state.messages.filter(isAdvisorCard)).toHaveLength(0);
+		expect(persisted).toEqual([]);
+
+		releaseCapture.resolve();
+		await capture;
+		await session.waitForIdle();
+
+		expect(session.agent.state.messages.filter(isAdvisorCard)).toHaveLength(1);
+		expect(persisted).toHaveLength(1);
+		expect(persisted[0]).toContain("capture-time concern");
+		expect(mock.calls).toHaveLength(0);
+		expect(advisorMock.calls.length).toBeGreaterThanOrEqual(1);
+	});
+
+	it("aborts and drains a blocked auto-learn capture during session disposal", async () => {
+		const { session } = await createIdleAdvisorSession([]);
+		const captureStarted = Promise.withResolvers<void>();
+		const abortObserved = Promise.withResolvers<void>();
+		const releaseCaptureTeardown = Promise.withResolvers<void>();
+		let captureSignal: AbortSignal | undefined;
+		let captureSettled = false;
+		const capture = session.runAutolearnCapture(async signal => {
+			captureSignal = signal;
+			signal.addEventListener("abort", () => abortObserved.resolve(), { once: true });
+			captureStarted.resolve();
+			await releaseCaptureTeardown.promise;
+			captureSettled = true;
+		});
+		await captureStarted.promise;
+
+		const disposing = session.dispose();
+		await abortObserved.promise;
+		let disposeResolved = false;
+		void disposing.then(() => {
+			disposeResolved = true;
+		});
+		await Bun.sleep(0);
+		expect(captureSignal?.aborted).toBe(true);
+		expect(disposeResolved).toBe(false);
+
+		releaseCaptureTeardown.resolve();
+		await Promise.all([capture, disposing]);
+		expect(captureSettled).toBe(true);
+	});
+
+	it("preserves an idle advisor nit after a terminal text stop, without waking a new primary turn", async () => {
+		const { session, sessionManager, mock, advisorMock } = await createIdleAdvisorSession([
+			{
+				content: [
+					{
+						type: "toolCall",
+						name: "advise",
+						arguments: { note: "tighten the wording", severity: "nit" },
+					},
+				],
+			},
+		]);
+		const persisted = capturePersistedAdvice(sessionManager);
+		const finalAssistant = {
+			role: "assistant" as const,
+			content: [{ type: "text" as const, text: "finished cleanly" }],
+			api: "anthropic-messages" as const,
+			provider: "anthropic" as const,
+			model: "claude-sonnet-4-5",
+			stopReason: "stop" as const,
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+		session.agent.emitExternalEvent({ type: "message_end", message: finalAssistant });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [finalAssistant] });
+		await session.waitForIdle();
+		expect(mock.calls.length).toBe(0);
+
+		session.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
+		expect(session.setAdvisorEnabled(true)).toBe(true);
+		const advisor = session.getAdvisorAgent();
+		if (!advisor) throw new Error("Expected advisor agent to be live");
+		await advisor.prompt("inspect current turn").catch(() => {});
+		await session.waitForIdle();
+
+		expect(session.agent.state.messages.filter(isAdvisorCard)).toHaveLength(1);
+		expect(persisted).toHaveLength(1);
+		expect(persisted[0]).toContain("tighten the wording");
+		expect(mock.calls.length).toBe(0);
+		expect(advisorMock.calls.length).toBeGreaterThanOrEqual(1);
+	});
+
+	it("steers delayed advisor advice into a newer live primary turn", async () => {
+		const primaryStarted = Promise.withResolvers<void>();
+		const releasePrimary = Promise.withResolvers<void>();
+		const { session, mock, advisorMock } = await createIdleAdvisorSession(
+			[
+				{
+					content: [
+						{
+							type: "toolCall",
+							name: "advise",
+							arguments: { note: "applies to the new turn", severity: "concern" },
+						},
+					],
+				},
+			],
+			[
+				async () => {
+					primaryStarted.resolve();
+					await releasePrimary.promise;
+					return { content: ["new turn draft"] };
+				},
+				{ content: ["handled live advisor advice"] },
+			],
+		);
+		const previousFinal = {
+			role: "assistant" as const,
+			content: [{ type: "text" as const, text: "previous turn finished" }],
+			api: "anthropic-messages" as const,
+			provider: "anthropic" as const,
+			model: "claude-sonnet-4-5",
+			stopReason: "stop" as const,
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+		session.agent.emitExternalEvent({ type: "message_end", message: previousFinal });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [previousFinal] });
+		await session.waitForIdle();
+
+		session.settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
+		expect(session.setAdvisorEnabled(true)).toBe(true);
+		const advisor = session.getAdvisorAgent();
+		if (!advisor) throw new Error("Expected advisor agent to be live");
+		const advisorRoute = Promise.withResolvers<"preserve" | "steer">();
+		const originalSteer = session.agent.steer.bind(session.agent);
+		vi.spyOn(session.agent, "steer").mockImplementation(message => {
+			originalSteer(message);
+			if (isAdvisorCard(message)) advisorRoute.resolve("steer");
+		});
+		const unsubscribeRoute = session.subscribe(event => {
+			if (event.type === "message_start" && isAdvisorCard(event.message)) {
+				advisorRoute.resolve("preserve");
+			}
+		});
+
+		const running = session.prompt("start a newer turn");
+		await primaryStarted.promise;
+		await advisor.prompt("inspect the new turn").catch(() => {});
+		const route = await advisorRoute.promise;
+		unsubscribeRoute();
+
+		releasePrimary.resolve();
+		await running;
+		await session.waitForIdle();
+
+		expect(route).toBe("steer");
+
+		expect(mock.calls).toHaveLength(2);
+		expect(
+			session.agent.state.messages.some(
+				message =>
+					message.role === "assistant" &&
+					message.content.some(
+						content => content.type === "text" && content.text === "handled live advisor advice",
+					),
+			),
+		).toBe(true);
+		expect(advisorMock.calls.length).toBeGreaterThanOrEqual(1);
 	});
 
 	it("reclaims a stranded advisor steer on settle while suppressed, instead of auto-resuming the stopped run", async () => {

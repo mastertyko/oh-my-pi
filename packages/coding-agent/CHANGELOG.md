@@ -34,6 +34,9 @@
 - Fixed agents getting stuck waiting for messages from peers that have already stopped running.
 - Fixed compiled Linux binary extension loading when bundled web-search header generation cannot read `header-generator` data files from the build-time path. ([#5178](https://github.com/can1357/oh-my-pi/issues/5178))
 - Fixed plugin custom tool loading to skip and report invalid feature entries instead of crashing startup when a plugin dependency tree leaves one feature unresolved. ([#5189](https://github.com/can1357/oh-my-pi/issues/5189))
+### Fixed
+
+- Fixed agent-authored maintenance turns repeating a completed answer: auto-learn capture now runs in an abortable private agent with only `manage_skill` plus optional memory `learn`, leaves the primary transcript, queues, and provider anchors untouched, and defers advisor delivery until capture teardown; terminal post-compaction answers, including Cursor-resolved exec tails, no longer auto-continue.
 
 ## [16.4.4] - 2026-07-11
 
