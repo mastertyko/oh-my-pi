@@ -1,6 +1,7 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { estimateTokens } from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantMessage, ImageContent, TextContent } from "@oh-my-pi/pi-ai";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 import { logger } from "@oh-my-pi/pi-utils";
 import { obfuscateToolArguments, type SecretObfuscator } from "../secrets/obfuscator";
 import { formatSessionHistoryMarkdown, PRIMARY_CONTEXT_CUSTOM_TYPES } from "../session/session-history-format";
@@ -66,6 +67,40 @@ export interface AdvisorRuntimeHost {
 interface PendingDelta {
 	text: string;
 	turns: number;
+}
+
+interface AdvisorPromptFailure {
+	error: Error;
+	retryable?: boolean;
+}
+
+function classifyAdvisorPromptFailure(
+	messages: readonly AgentMessage[],
+	snapshot: number,
+	stateError: string | undefined,
+): AdvisorPromptFailure | undefined {
+	let lastAssistant: AssistantMessage | undefined;
+	let replayUnsafe = false;
+	for (let index = snapshot; index < messages.length; index++) {
+		const message = messages[index];
+		if (message.role !== "assistant") continue;
+		lastAssistant = message;
+		if (message.content.some(block => block.type === "toolCall")) {
+			replayUnsafe = true;
+		}
+	}
+
+	if (!lastAssistant) {
+		return stateError ? { error: new Error(stateError) } : undefined;
+	}
+	if (lastAssistant.stopReason !== "error") return undefined;
+
+	const hasStructuredErrorId = typeof lastAssistant.errorId === "number";
+	const errorId = AIError.classifyMessage(lastAssistant);
+	const error = AIError.attach(new Error(lastAssistant.errorMessage ?? stateError ?? "Advisor turn failed"), errorId);
+	if (replayUnsafe) return { error, retryable: false };
+	if (!hasStructuredErrorId) return { error };
+	return { error, retryable: AIError.retriable(errorId, { replayUnsafe }) };
 }
 
 interface CatchupWaiter {
@@ -332,6 +367,7 @@ export class AdvisorRuntime {
 				}
 
 				let success = false;
+				let failure: AdvisorPromptFailure | undefined;
 				// Capture the advisor's message count BEFORE the prompt so a failure can
 				// roll back the user batch + synthetic assistant-error turn `Agent.#runLoop`
 				// appends to internal state. Without this, a retry would replay the
@@ -344,27 +380,35 @@ export class AdvisorRuntime {
 					// fresh budget. Dedupe history persists across cycles.
 					this.host.beginAdvisorUpdate?.();
 					await this.agent.prompt(batch);
-					// `Agent.#runLoop` catches provider/stream failures internally and
-					// resolves `prompt()` cleanly with the assistant turn ending in
-					// `stopReason: "error"` and the message recorded on `state.error`.
-					// Treat that as a failed turn so OpenRouter ZDR-style endpoint
-					// rejections trip the retry/notify path instead of looking like a
-					// successful empty cycle.
-					const promptError = this.agent.state.error;
-					if (promptError) throw new Error(promptError);
+					// Provider/stream failures normally resolve `prompt()` with a finalized
+					// assistant error message. Its `errorId` retains canonical retryability;
+					// `state.error` is only the human-readable fallback used by hand-written
+					// facades and genuine prompt rejections.
+					failure = classifyAdvisorPromptFailure(
+						this.agent.state.messages,
+						messageSnapshot,
+						this.agent.state.error,
+					);
+					if (failure) throw failure.error;
 					success = true;
 					this.#consecutiveFailures = 0;
 					this.#failureNotified = false;
-				} catch (err) {
+				} catch (caught) {
 					// reset()/dispose() aborts the in-flight prompt; the rejection is the
 					// reset itself, not a transient advisor failure. Drop the stale batch
 					// (reset already cleared #pending and rewound the cursor) instead of
 					// requeuing it into the post-reset conversation.
 					if (this.#epoch !== epoch) continue;
+					failure ??= classifyAdvisorPromptFailure(
+						this.agent.state.messages,
+						messageSnapshot,
+						this.agent.state.error,
+					);
+					const error = failure?.error ?? caught;
 					this.#rollbackFailedTurn(messageSnapshot);
-					logger.debug("advisor turn failed", { err: String(err) });
+					logger.debug("advisor turn failed", { err: String(error) });
 					try {
-						await this.host.onTurnError?.(err);
+						await this.host.onTurnError?.(error);
 					} catch (hookErr) {
 						logger.debug("advisor onTurnError hook failed", { err: String(hookErr) });
 					}
@@ -372,12 +416,15 @@ export class AdvisorRuntime {
 					// prompt await above — drop it instead of requeueing stale content.
 					if (this.#epoch !== epoch) continue;
 					this.#consecutiveFailures++;
-					if (this.#consecutiveFailures >= 3) {
-						logger.warn("advisor failed consecutively 3 times; dropping backlog to prevent stall");
+					const terminalFailure = failure?.retryable === false;
+					if (terminalFailure || this.#consecutiveFailures >= 3) {
+						if (!terminalFailure) {
+							logger.warn("advisor failed consecutively 3 times; dropping backlog to prevent stall");
+						}
 						if (!this.#failureNotified) {
 							this.#failureNotified = true;
 							try {
-								this.host.notifyFailure?.(err);
+								this.host.notifyFailure?.(error);
 							} catch (notifyErr) {
 								logger.warn("advisor failure notification failed", { err: String(notifyErr) });
 							}

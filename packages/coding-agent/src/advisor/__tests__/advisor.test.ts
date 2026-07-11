@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from "bun:test";
 import type { AgentMessage, AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
+import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 import type { TUI } from "@oh-my-pi/pi-tui";
 import { type } from "arktype";
 import type { ModelRegistry } from "../../config/model-registry";
@@ -29,6 +31,24 @@ import {
 	resolveAdvisorDeliveryChannel,
 	type WatchdogConfigDoc,
 } from "..";
+
+interface AdvisorAssistantMessageOptions {
+	stopReason: AssistantMessage["stopReason"];
+	content?: AssistantMessage["content"];
+	errorMessage?: string;
+	errorId?: number;
+}
+
+function advisorAssistantMessage(options: AdvisorAssistantMessageOptions): AgentMessage {
+	return {
+		role: "assistant",
+		content: options.content ?? [{ type: "text", text: "" }],
+		stopReason: options.stopReason,
+		errorMessage: options.errorMessage,
+		errorId: options.errorId,
+		timestamp: Date.now(),
+	} as unknown as AgentMessage;
+}
 
 describe("advisor", () => {
 	describe("advisor system prompt", () => {
@@ -1292,6 +1312,232 @@ describe("advisor", () => {
 			await Bun.sleep(0);
 
 			expect(failures).toHaveLength(2);
+		});
+
+		it("drops a structured non-retryable advisor failure without retrying", async () => {
+			const errorMessage = "Codex response failed: Request blocked (code=invalid_prompt)";
+			const promptInputs: string[] = [];
+			const rollbackCalls: number[] = [];
+			const turnErrors: unknown[] = [];
+			const failures: unknown[] = [];
+			const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
+			const agent: AdvisorAgent = {
+				prompt: async input => {
+					promptInputs.push(input);
+					state.messages.push({ role: "user", content: input, timestamp: Date.now() } as AgentMessage);
+					state.messages.push(advisorAssistantMessage({ stopReason: "error", errorMessage, errorId: 0 }));
+					state.error = errorMessage;
+				},
+				abort: () => {},
+				reset: () => {},
+				rollbackTo: count => {
+					rollbackCalls.push(count);
+					state.messages.length = count;
+					state.error = undefined;
+				},
+				state,
+			};
+			const messages: AgentMessage[] = [{ role: "user", content: "aaa", timestamp: 1 } as AgentMessage];
+			const host: AdvisorRuntimeHost = {
+				snapshotMessages: () => messages,
+				enqueueAdvice: () => {},
+				onTurnError: error => {
+					turnErrors.push(error);
+				},
+				notifyFailure: error => failures.push(error),
+			};
+			const runtime = new AdvisorRuntime(agent, host, 0);
+
+			runtime.onTurnEnd(messages);
+			await runtime.waitForCatchup(1000, 1);
+
+			expect(promptInputs).toHaveLength(1);
+			expect(rollbackCalls).toEqual([0]);
+			expect(turnErrors).toHaveLength(1);
+			expect(failures).toHaveLength(1);
+			expect(state.messages).toHaveLength(0);
+			expect(runtime.backlog).toBe(0);
+		});
+
+		it("retries a structured transient advisor failure and settles on success", async () => {
+			const promptInputs: string[] = [];
+			const rollbackCalls: number[] = [];
+			const turnErrors: unknown[] = [];
+			const failures: unknown[] = [];
+			const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
+			const transientErrorId = AIError.create(AIError.Flag.Transient);
+			const agent: AdvisorAgent = {
+				prompt: async input => {
+					promptInputs.push(input);
+					state.messages.push({ role: "user", content: input, timestamp: Date.now() } as AgentMessage);
+					if (promptInputs.length === 1) {
+						state.messages.push(
+							advisorAssistantMessage({
+								stopReason: "error",
+								errorMessage: "temporary provider failure",
+								errorId: transientErrorId,
+							}),
+						);
+						state.error = "temporary provider failure";
+						return;
+					}
+					state.messages.push(advisorAssistantMessage({ stopReason: "stop" }));
+					state.error = undefined;
+				},
+				abort: () => {},
+				reset: () => {},
+				rollbackTo: count => {
+					rollbackCalls.push(count);
+					state.messages.length = count;
+					state.error = undefined;
+				},
+				state,
+			};
+			const messages: AgentMessage[] = [{ role: "user", content: "aaa", timestamp: 1 } as AgentMessage];
+			const host: AdvisorRuntimeHost = {
+				snapshotMessages: () => messages,
+				enqueueAdvice: () => {},
+				onTurnError: error => {
+					turnErrors.push(error);
+				},
+				notifyFailure: error => failures.push(error),
+			};
+			const runtime = new AdvisorRuntime(agent, host, 0);
+
+			runtime.onTurnEnd(messages);
+			await runtime.waitForCatchup(1000, 1);
+
+			expect(promptInputs).toHaveLength(2);
+			expect(rollbackCalls).toEqual([0]);
+			expect(turnErrors).toHaveLength(1);
+			expect(failures).toHaveLength(0);
+			expect(state.messages).toHaveLength(2);
+			expect(runtime.backlog).toBe(0);
+		});
+
+		for (const [classification, errorId] of [
+			["a structured transient", AIError.create(AIError.Flag.Transient)],
+			["an unclassified", undefined],
+		] as const) {
+			it(`does not replay ${classification} failure after an advisor tool call`, async () => {
+				const promptInputs: string[] = [];
+				const rollbackCalls: number[] = [];
+				const failures: unknown[] = [];
+				const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
+				const agent: AdvisorAgent = {
+					prompt: async input => {
+						promptInputs.push(input);
+						state.messages.push({ role: "user", content: input, timestamp: Date.now() } as AgentMessage);
+						state.messages.push(
+							advisorAssistantMessage({
+								stopReason: "toolUse",
+								content: [
+									{
+										type: "toolCall",
+										id: "write-once",
+										name: "write",
+										arguments: { path: "state.txt", content: "changed" },
+									},
+								],
+							}),
+						);
+						state.messages.push({
+							role: "toolResult",
+							toolCallId: "write-once",
+							toolName: "write",
+							content: [{ type: "text", text: "ok" }],
+							isError: false,
+							timestamp: Date.now(),
+						} as AgentMessage);
+						state.messages.push(
+							advisorAssistantMessage({
+								stopReason: "error",
+								errorMessage: "temporary provider failure",
+								errorId,
+							}),
+						);
+						state.error = "temporary provider failure";
+					},
+					abort: () => {},
+					reset: () => {},
+					rollbackTo: count => {
+						rollbackCalls.push(count);
+						state.messages.length = count;
+						state.error = undefined;
+					},
+					state,
+				};
+				const messages: AgentMessage[] = [{ role: "user", content: "aaa", timestamp: 1 } as AgentMessage];
+				const host: AdvisorRuntimeHost = {
+					snapshotMessages: () => messages,
+					enqueueAdvice: () => {},
+					notifyFailure: error => failures.push(error),
+				};
+				const runtime = new AdvisorRuntime(agent, host, 0);
+
+				runtime.onTurnEnd(messages);
+				await runtime.waitForCatchup(1000, 1);
+
+				expect(promptInputs).toHaveLength(1);
+				expect(rollbackCalls).toEqual([0]);
+				expect(failures).toHaveLength(1);
+				expect(runtime.backlog).toBe(0);
+			});
+		}
+
+		it("settles only a non-retryable batch and continues newer pending work", async () => {
+			const promptInputs: string[] = [];
+			const rollbackCalls: number[] = [];
+			const failures: unknown[] = [];
+			const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
+			const { promise: firstPromptStarted, resolve: startFirstPrompt } = Promise.withResolvers<void>();
+			const { promise: releaseFirstPrompt, resolve: finishFirstPrompt } = Promise.withResolvers<void>();
+			const agent: AdvisorAgent = {
+				prompt: async input => {
+					promptInputs.push(input);
+					state.messages.push({ role: "user", content: input, timestamp: Date.now() } as AgentMessage);
+					if (promptInputs.length === 1) {
+						startFirstPrompt();
+						await releaseFirstPrompt;
+						const errorMessage = "Codex response failed: Request blocked (code=invalid_prompt)";
+						state.messages.push(advisorAssistantMessage({ stopReason: "error", errorMessage, errorId: 0 }));
+						state.error = errorMessage;
+						return;
+					}
+					state.messages.push(advisorAssistantMessage({ stopReason: "stop" }));
+					state.error = undefined;
+				},
+				abort: () => {},
+				reset: () => {},
+				rollbackTo: count => {
+					rollbackCalls.push(count);
+					state.messages.length = count;
+					state.error = undefined;
+				},
+				state,
+			};
+			const messages: AgentMessage[] = [{ role: "user", content: "first", timestamp: 1 } as AgentMessage];
+			const host: AdvisorRuntimeHost = {
+				snapshotMessages: () => messages,
+				enqueueAdvice: () => {},
+				notifyFailure: error => failures.push(error),
+			};
+			const runtime = new AdvisorRuntime(agent, host, 0);
+
+			runtime.onTurnEnd(messages);
+			await firstPromptStarted;
+			messages.push({ role: "user", content: "second", timestamp: 2 } as AgentMessage);
+			runtime.onTurnEnd(messages);
+			finishFirstPrompt();
+			await runtime.waitForCatchup(1000, 1);
+
+			expect(promptInputs).toHaveLength(2);
+			expect(promptInputs[0]).toContain("first");
+			expect(promptInputs[1]).toContain("second");
+			expect(promptInputs[1]).not.toContain("first");
+			expect(rollbackCalls).toEqual([0]);
+			expect(failures).toHaveLength(1);
+			expect(runtime.backlog).toBe(0);
 		});
 
 		it("calls onTurnError with state.error before retrying the batch", async () => {
