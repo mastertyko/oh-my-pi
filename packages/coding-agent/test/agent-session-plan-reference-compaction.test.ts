@@ -182,6 +182,22 @@ describe("AgentSession approved-plan reference re-injection after compaction (is
 		});
 
 		session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
+		// These contracts exercise an ongoing executor turn. Terminal-aware compaction
+		// only auto-resumes a completed text tail while an active goal still requires work.
+		const now = Date.now();
+		session.setGoalModeState({
+			enabled: true,
+			mode: "active",
+			goal: {
+				id: `plan-reference-${strategy}`,
+				objective: "continue executing the active plan",
+				status: "active",
+				tokensUsed: 0,
+				timeUsedSeconds: 0,
+				createdAt: now,
+				updatedAt: now,
+			},
+		});
 
 		const waitForCall = (predicate: (call: ObservedPromptCall) => boolean) => {
 			const existing = observedCalls.find(predicate);

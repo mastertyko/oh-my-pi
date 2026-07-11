@@ -422,7 +422,16 @@ describe("AgentSession empty stop guard", () => {
 		session.subscribe(event => {
 			if (event.type === "auto_retry_end") retryEndEvents.push(event);
 		});
-		new AutoLearnController({ session, settings: session.settings });
+		new AutoLearnController({
+			session,
+			settings: session.settings,
+			capture: async content => {
+				await session.sendCustomMessage(
+					{ customType: "autolearn-nudge", content, display: false, attribution: "user" },
+					{ deliverAs: "nextTurn", triggerTurn: true, acceptTerminalEmptyStop: true },
+				);
+			},
+		});
 
 		await session.prompt("record enough facts for auto-learn");
 		await session.waitForIdle();
@@ -517,7 +526,16 @@ describe("AgentSession empty stop guard", () => {
 		session.subscribe(event => {
 			if (event.type === "auto_retry_end") retryEndEvents.push(event);
 		});
-		new AutoLearnController({ session, settings: session.settings });
+		new AutoLearnController({
+			session,
+			settings: session.settings,
+			capture: async content => {
+				await session.sendCustomMessage(
+					{ customType: "autolearn-nudge", content, display: false, attribution: "user" },
+					{ deliverAs: "nextTurn", triggerTurn: true, acceptTerminalEmptyStop: true },
+				);
+			},
+		});
 
 		await session.prompt("record enough facts for auto-learn");
 		await session.waitForIdle();
