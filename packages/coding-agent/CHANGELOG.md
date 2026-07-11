@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed agent-authored summary/continuation turns repeating a completed answer by hiding autolearn capture output, preserving idle advisor concerns and nits without waking a new primary turn, and skipping post-compaction auto-continue when the compacted tail is already a terminal text answer.
+
 ## [16.4.2] - 2026-07-10
 
 ### Fixed
@@ -20,9 +24,6 @@
 ### Fixed
 
 - Fixed MCP OAuth dynamic client registration omitting discovered scopes on the RFC 7591 registration body. Providers such as Clerk bind DCR-created clients to only the scopes declared at registration, then reject the subsequent authorize request when it asks for `openid` (from `scopes_supported`). Registration now includes `config.scopes` when present, matching Claude Code and the scopes already sent on authorize.
-### Fixed
-
-- Fixed agent-authored summary/continuation turns repeating a completed answer by hiding autolearn capture output, preserving idle advisor concerns and nits without waking a new primary turn, and skipping post-compaction auto-continue when the compacted tail is already a terminal text answer.
 
 ## [16.4.0] - 2026-07-10
 

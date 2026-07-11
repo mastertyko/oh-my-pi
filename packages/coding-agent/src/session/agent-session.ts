@@ -2066,7 +2066,18 @@ export class AgentSession {
 		this.#autolearnCaptureTurnBaseMessageCount = undefined;
 		const messages = this.agent.state.messages;
 		if (messages.length <= baseMessageCount) return;
+		// The hidden loop can dequeue real user input before it stops. Drop its
+		// synthetic output, but replay consumed user messages ahead of later arrivals.
+		// Hidden companions travel with their user prompt in the same original order.
+		const consumedUserMessages = messages
+			.slice(baseMessageCount)
+			.filter(message => isUserQueuedMessage(message) || isHiddenUserCompanion(message));
 		this.agent.replaceMessages(messages.slice(0, baseMessageCount));
+		if (consumedUserMessages.length === 0) return;
+		this.agent.replaceQueues(
+			[...consumedUserMessages, ...this.agent.peekSteeringQueue()],
+			[...this.agent.peekFollowUpQueue()],
+		);
 	}
 
 	#resetInFlight(): void {
@@ -2736,7 +2747,7 @@ export class AgentSession {
 			this.#preserveAdvisorCard(card);
 			return;
 		}
-		if (this.#isIdleTerminalTextAnswer()) {
+		if (this.#terminalTextAnswerTailActive && this.#isIdleTerminalTextAnswer()) {
 			if (channel === "steer") this.#recordAdvisorInterruptDelivered();
 			this.#preserveAdvisorCard(card);
 			return;
@@ -3346,6 +3357,8 @@ export class AgentSession {
 
 	// Track last assistant message for auto-compaction check
 	#lastAssistantMessage: AssistantMessage | undefined = undefined;
+	/** True after a visible terminal text answer until the next primary model turn starts. */
+	#terminalTextAnswerTailActive = false;
 
 	/** Internal handler for agent events - shared by subscribe and reconnect.
 	 *
@@ -3607,6 +3620,11 @@ export class AgentSession {
 	#processAgentEvent = async (event: AgentEvent): Promise<void> => {
 		const suppressAutolearnCaptureTurnEvent = this.#isAutolearnCaptureTurnEvent(event);
 		if (suppressAutolearnCaptureTurnEvent) return;
+		if (event.type === "agent_start" || event.type === "turn_start") {
+			this.#terminalTextAnswerTailActive = false;
+		} else if (event.type === "message_end" && event.message.role === "assistant") {
+			this.#terminalTextAnswerTailActive = this.#isTerminalTextAnswer(event.message);
+		}
 		// Step the mid-run todo counter synchronously, BEFORE any await in this
 		// handler. The agent loop's next-turn `getAsideMessages` poll can run
 		// before queued microtasks drain, so `#takeMidRunTodoNudge` MUST see the
@@ -4952,13 +4970,16 @@ export class AgentSession {
 		return undefined;
 	}
 
+	#isTerminalTextAnswer(message: AgentMessage | undefined): message is AssistantMessage {
+		if (message?.role !== "assistant" || message.stopReason !== "stop") return false;
+		if (message.content.some(content => content.type === "toolCall")) return false;
+		return hasNonWhitespace(textFromContent(message.content));
+	}
+
 	#isIdleTerminalTextAnswer(): boolean {
 		if (this.agent.hasQueuedMessages()) return false;
 		if (this.#goalModeState?.enabled === true && this.#goalModeState.goal.status === "active") return false;
-		const assistant = this.#findLastAssistantMessage();
-		if (assistant?.stopReason !== "stop") return false;
-		if (assistant.content.some(content => content.type === "toolCall")) return false;
-		return hasNonWhitespace(textFromContent(assistant.content));
+		return this.#isTerminalTextAnswer(this.#findLastAssistantMessage());
 	}
 
 	#resetStreamingEditState(): void {

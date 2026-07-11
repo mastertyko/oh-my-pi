@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import { createMockModel, type MockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
+import { createMockModel, type MockModel, type MockResponseSource } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { AutoLearnController, buildAutoLearnInstructions } from "@oh-my-pi/pi-coding-agent/autolearn/controller";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -102,7 +102,7 @@ function messageText(message: { content?: unknown }): string {
 	return parts.join("\n");
 }
 
-async function createAutoLearnSessionHarness(responses: MockResponse[]): Promise<AutoLearnSessionHarness> {
+async function createAutoLearnSessionHarness(responses: MockResponseSource): Promise<AutoLearnSessionHarness> {
 	const tempDir = TempDir.createSync("@pi-autolearn-capture-");
 	const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
 	authStorage.setRuntimeApiKey("anthropic", "test-key");
@@ -401,6 +401,62 @@ it("hides capture-turn assistant text while still clearing suppression on its ag
 					messageText(entry.message) === "Second real answer",
 			).length,
 	).toBe(1);
+});
+
+it("requeues a user steer consumed during a hidden capture turn", async () => {
+	const captureStarted = Promise.withResolvers<void>();
+	const releaseCapture = Promise.withResolvers<void>();
+	const { session, mock } = await createAutoLearnSessionHarness([
+		async () => {
+			captureStarted.resolve();
+			await releaseCapture.promise;
+			return { content: ["capture complete"] };
+		},
+		{ content: ["hidden response to user steer"] },
+		{ content: ["visible response to user steer"] },
+	]);
+	const captureSettled = Promise.withResolvers<void>();
+	let agentEnds = 0;
+	session.subscribe(event => {
+		if (event.type !== "agent_end") return;
+		agentEnds++;
+		if (agentEnds === 2) captureSettled.resolve();
+	});
+
+	for (let i = 0; i < 5; i++) {
+		session.agent.emitExternalEvent({
+			type: "tool_execution_end",
+			toolCallId: `capture-${i}`,
+			toolName: "read",
+			result: null,
+		});
+	}
+	const finalAssistant = createAssistantMessage("Visible final answer");
+	session.agent.emitExternalEvent({ type: "message_end", message: finalAssistant });
+	session.agent.emitExternalEvent({ type: "agent_end", messages: [finalAssistant] });
+
+	await captureStarted.promise;
+	await session.prompt("urgent user correction", { streamingBehavior: "steer" });
+	releaseCapture.resolve();
+	await captureSettled.promise;
+	await session.waitForIdle();
+
+	expect(mock.calls).toHaveLength(3);
+	expect(
+		session.messages.filter(message => message.role === "user" && messageText(message) === "urgent user correction"),
+	).toHaveLength(1);
+	expect(
+		session.messages.some(
+			message => message.role === "assistant" && messageText(message) === "visible response to user steer",
+		),
+	).toBe(true);
+	expect(
+		session.messages.some(
+			message =>
+				message.role === "assistant" &&
+				(messageText(message) === "capture complete" || messageText(message) === "hidden response to user steer"),
+		),
+	).toBe(false);
 });
 
 describe("buildAutoLearnInstructions", () => {
