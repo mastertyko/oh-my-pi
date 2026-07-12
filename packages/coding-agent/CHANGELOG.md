@@ -8,6 +8,9 @@
 
 - Improved search reliability for Perplexity provider by forcing retrieval for all queries
 - Fixed JS eval cells losing top-level `function` and `var` declarations across cells when the defining cell contained top-level `await` — the async wrapper scoped them to the cell's IIFE instead of publishing them to the worker global
+### Fixed
+
+- Fixed advisor context maintenance to account for provider-reported cached context plus advisor prompt/tool headroom, and made overflow recovery stay at the current primary cursor, retry each overflowing update at most once on a fresh context, and keep later updates eligible.
 
 ## [16.4.7] - 2026-07-12
 
