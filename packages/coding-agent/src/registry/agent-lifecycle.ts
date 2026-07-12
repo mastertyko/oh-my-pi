@@ -12,9 +12,15 @@
 
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AgentSession } from "../session/agent-session";
-import { type AgentRef, AgentRegistry, MAIN_AGENT_ID, type RegistryEvent } from "./agent-registry";
+import {
+	type AgentRef,
+	type AgentRefExpectation,
+	AgentRegistry,
+	MAIN_AGENT_ID,
+	type RegistryEvent,
+} from "./agent-registry";
 
-export type AgentReviver = () => Promise<AgentSession>;
+export type AgentReviver = (expected: AgentRef) => Promise<AgentSession>;
 
 /**
  * Builds a reviver for a `parked` ref restored from disk (Agent Hub scan,
@@ -33,9 +39,15 @@ export interface AdoptOptions {
 }
 
 interface AdoptedAgent {
+	ref: AgentRef;
 	idleTtlMs: number;
 	revive?: AgentReviver;
 	timer?: NodeJS.Timeout;
+}
+
+interface RevivingAgent {
+	ref: AgentRef;
+	promise: Promise<AgentSession>;
 }
 
 export class AgentLifecycleManager {
@@ -67,10 +79,10 @@ export class AgentLifecycleManager {
 
 	readonly #registry: AgentRegistry;
 	readonly #adopted = new Map<string, AdoptedAgent>();
-	/** Ids whose session is being disposed by {@link park} right now. */
-	readonly #parking = new Set<string>();
-	/** In-flight revives, so concurrent {@link ensureLive} calls coalesce. */
-	readonly #revivals = new Map<string, Promise<AgentSession>>();
+	/** Exact refs whose session is being disposed by {@link park} right now. */
+	readonly #parking = new Map<string, AgentRef>();
+	/** In-flight revives, bound to the parked ref that initiated them. */
+	readonly #revivals = new Map<string, RevivingAgent>();
 	#unsubscribe: (() => void) | undefined;
 	#persistedReviverFactory: PersistedSubagentReviverFactory | undefined;
 	/** TTL applied when a cold-revived ref is adopted on demand. */
@@ -96,27 +108,32 @@ export class AgentLifecycleManager {
 	 * Take ownership of a finished subagent. Caller has already set registry
 	 * status to "idle". Arms the TTL timer (idleTtlMs <= 0 adopts without one).
 	 */
-	adopt(id: string, opts: AdoptOptions): void {
+	adopt(id: string, opts: AdoptOptions, expected?: AgentRefExpectation): void {
 		if (id === MAIN_AGENT_ID) return;
-		if (!this.#registry.get(id)) {
-			logger.warn("AgentLifecycleManager.adopt: unknown agent id", { id });
+		const ref = this.#registry.get(id);
+		if (!ref || (expected !== undefined && ref !== expected && ref.session !== expected)) {
+			logger.warn("AgentLifecycleManager.adopt: unknown or replaced agent id", { id });
 			return;
 		}
 		const existing = this.#adopted.get(id);
 		clearTimeout(existing?.timer);
-		const adopted: AdoptedAgent = { idleTtlMs: opts.idleTtlMs, revive: opts.revive };
+		const adopted: AdoptedAgent = { ref, idleTtlMs: opts.idleTtlMs, revive: opts.revive };
 		this.#adopted.set(id, adopted);
 		this.#armTimer(id, adopted);
 	}
 
 	/** True if the id is adopted (parked or live). */
-	has(id: string): boolean {
-		return this.#adopted.has(id);
+	has(id: string, expected?: AgentRefExpectation): boolean {
+		const adopted = this.#adopted.get(id);
+		return Boolean(
+			adopted && (expected === undefined || adopted.ref === expected || adopted.ref.session === expected),
+		);
 	}
 
 	/** True while {@link park} is disposing this agent's session (lets dispose hooks distinguish park from teardown). */
-	isParking(id: string): boolean {
-		return this.#parking.has(id);
+	isParking(id: string, expected?: AgentRefExpectation): boolean {
+		const ref = this.#parking.get(id);
+		return Boolean(ref && (expected === undefined || ref === expected || ref.session === expected));
 	}
 
 	/**
@@ -125,24 +142,24 @@ export class AgentLifecycleManager {
 	 */
 	async park(id: string): Promise<void> {
 		const adopted = this.#adopted.get(id);
-		if (!adopted) return;
 		const ref = this.#registry.get(id);
-		if (!ref?.session) return;
+		if (!adopted || adopted.ref !== ref || !ref.session) return;
+		const liveSession = ref.session;
 		if (adopted.timer) {
 			clearTimeout(adopted.timer);
 			adopted.timer = undefined;
 		}
-		this.#parking.add(id);
+		this.#parking.set(id, ref);
 		try {
 			try {
-				await ref.session.dispose();
+				await liveSession.dispose();
 			} catch (error) {
 				logger.warn("AgentLifecycleManager.park: session dispose failed", { id, error: String(error) });
 			}
-			this.#registry.detachSession(id);
-			this.#registry.setStatus(id, "parked");
+			this.#registry.detachSession(id, ref);
+			this.#registry.setStatus(id, "parked", ref);
 		} finally {
-			this.#parking.delete(id);
+			if (this.#parking.get(id) === ref) this.#parking.delete(id);
 		}
 	}
 
@@ -160,13 +177,14 @@ export class AgentLifecycleManager {
 		}
 		if (ref.session) return ref.session;
 		const inflight = this.#revivals.get(id);
-		if (inflight) return inflight;
+		if (inflight?.ref === ref) return inflight.promise;
 		const revival = this.#resolveAndRevive(id, ref);
-		this.#revivals.set(id, revival);
+		const pending: RevivingAgent = { ref, promise: revival };
+		this.#revivals.set(id, pending);
 		try {
 			return await revival;
 		} finally {
-			this.#revivals.delete(id);
+			if (this.#revivals.get(id) === pending) this.#revivals.delete(id);
 		}
 	}
 
@@ -178,63 +196,97 @@ export class AgentLifecycleManager {
 	 * when the agent is not revivable or no reviver can be produced.
 	 */
 	async #resolveAndRevive(id: string, ref: AgentRef): Promise<AgentSession> {
-		let revive = this.#adopted.get(id)?.revive;
+		let adoption = this.#adopted.get(id);
+		let revive = adoption?.ref === ref ? adoption.revive : undefined;
 		let coldAdopted = false;
 		if (!revive && ref.status === "parked" && ref.sessionFile && this.#persistedReviverFactory) {
 			revive = await this.#persistedReviverFactory(ref);
 			if (revive) {
-				this.#adopted.set(id, { idleTtlMs: this.#persistedReviveTtlMs, revive });
+				adoption = { ref, idleTtlMs: this.#persistedReviveTtlMs, revive };
+				this.#adopted.set(id, adoption);
 				coldAdopted = true;
 			}
 		}
-		if (ref.status !== "parked" || !revive) {
+		if (this.#registry.get(id) !== ref) {
+			throw new Error(`Agent "${id}" changed while its persisted session was being prepared.`);
+		}
+		if (ref.status !== "parked" || !revive || !adoption) {
 			throw new Error(
 				`Agent "${id}" is ${ref.status} and cannot be revived${revive ? "" : " (no reviver registered)"}. Its transcript remains readable at history://${id}.`,
 			);
 		}
 		try {
-			return await this.#revive(id, revive, ref.sessionFile);
+			return await this.#revive(id, revive, ref, adoption);
 		} catch (error) {
 			// A failed cold revive (stale ctx, missing cwd, bad MCP) must not leave a
 			// poisoned reviver stuck in #adopted — drop it so a later ensureLive
 			// rebuilds via the factory (which may have fresher context by then).
-			if (coldAdopted) this.#adopted.delete(id);
+			if (coldAdopted && this.#adopted.get(id) === adoption) this.#adopted.delete(id);
 			throw error;
 		}
 	}
 
 	/** Hard removal: dispose if live, unregister from registry, drop timers. */
-	async release(id: string): Promise<void> {
+	async release(id: string, expected?: AgentRefExpectation): Promise<boolean> {
 		const adopted = this.#adopted.get(id);
-		clearTimeout(adopted?.timer);
-		this.#adopted.delete(id);
-		const ref = this.#registry.get(id);
-		if (ref?.session) {
+		const current = this.#registry.get(id);
+		const currentMatches =
+			current && (expected === undefined || current === expected || current.session === expected);
+		const adoptedMatches =
+			adopted && (expected === undefined || adopted.ref === expected || adopted.ref.session === expected);
+		const ref = currentMatches ? current : adoptedMatches ? adopted.ref : undefined;
+		if (!ref) return false;
+		if (adopted?.ref === ref) {
+			clearTimeout(adopted.timer);
+			this.#adopted.delete(id);
+		}
+		const liveSession = ref.session;
+		if (liveSession) {
 			try {
-				await ref.session.dispose();
+				await liveSession.dispose();
 			} catch (error) {
 				logger.warn("AgentLifecycleManager.release: session dispose failed", { id, error: String(error) });
 			}
 		}
-		this.#registry.unregister(id);
+		this.#registry.unregister(id, ref);
+		return true;
 	}
 
 	/** Teardown everything (process exit / main session dispose). */
 	async dispose(): Promise<void> {
 		this.#unsubscribe?.();
 		this.#unsubscribe = undefined;
-		const ids = [...this.#adopted.keys()];
-		await Promise.all(ids.map(id => this.release(id)));
+		const adopted = [...this.#adopted.values()];
+		await Promise.all(adopted.map(entry => this.release(entry.ref.id, entry.ref)));
 		this.#revivals.clear();
 		this.#parking.clear();
 		this.#persistedReviverFactory = undefined;
 	}
 
-	async #revive(id: string, revive: AgentReviver, sessionFile: string | null): Promise<AgentSession> {
-		const session = await revive();
-		this.#registry.attachSession(id, session, sessionFile);
-		// Emits status_changed → "idle", which re-arms the TTL timer below.
-		this.#registry.setStatus(id, "idle");
+	async #revive(id: string, revive: AgentReviver, ref: AgentRef, adopted: AdoptedAgent): Promise<AgentSession> {
+		const session = await revive(ref);
+		let liveRef = this.#registry.get(id);
+		if (liveRef === ref) {
+			if (!this.#registry.attachSession(id, session, ref.sessionFile, ref)) {
+				await session.dispose();
+				throw new Error(`Agent "${id}" changed before its persisted session could attach.`);
+			}
+			liveRef = ref;
+		} else if (
+			!liveRef ||
+			liveRef.session !== session ||
+			liveRef.kind !== ref.kind ||
+			liveRef.parentId !== ref.parentId ||
+			liveRef.sessionFile !== ref.sessionFile
+		) {
+			await session.dispose();
+			throw new Error(`Agent "${id}" was replaced while its persisted session was reviving.`);
+		}
+		adopted.ref = liveRef;
+		if (!this.#registry.setStatus(id, "idle", liveRef)) {
+			await session.dispose();
+			throw new Error(`Agent "${id}" changed before its persisted session became idle.`);
+		}
 		return session;
 	}
 
@@ -251,7 +303,7 @@ export class AgentLifecycleManager {
 
 	#onRegistryEvent(event: RegistryEvent): void {
 		const adopted = this.#adopted.get(event.ref.id);
-		if (!adopted) return;
+		if (!adopted || adopted.ref !== event.ref) return;
 		if (event.type === "removed") {
 			clearTimeout(adopted.timer);
 			this.#adopted.delete(event.ref.id);

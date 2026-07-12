@@ -25,7 +25,9 @@ import { IrcBus } from "../../irc/bus";
 import { AgentLifecycleManager } from "../../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry, type AgentStatus, MAIN_AGENT_ID } from "../../registry/agent-registry";
 import { USER_INTERRUPT_LABEL } from "../../session/messages";
+import { SessionManager } from "../../session/session-manager";
 import { replaceTabs, TRUNCATE_LENGTHS, truncateToWidth } from "../../tools/render-utils";
+import { persistedVibeChildIds } from "../../vibe/runtime";
 import type { ObservableSession, SessionObserverRegistry } from "../session-observer-registry";
 import { theme } from "../theme/theme";
 import { matchesSelectDown, matchesSelectUp } from "../utils/keybinding-matchers";
@@ -69,19 +71,35 @@ function statusBadge(status: AgentStatus): string {
 	}
 }
 
+async function readPersistedVibeChildIds(sessionFile: string): Promise<Set<string>> {
+	let sessionManager: SessionManager;
+	try {
+		sessionManager = await SessionManager.open(sessionFile, undefined, undefined, { suppressBreadcrumb: true });
+	} catch {
+		return new Set();
+	}
+	try {
+		return persistedVibeChildIds(sessionManager.getEntries());
+	} finally {
+		await sessionManager.close();
+	}
+}
+
 async function registerPersistedSubagents(
 	registry: AgentRegistry,
 	sessionFile: string | null | undefined,
 ): Promise<void> {
 	if (!sessionFile?.endsWith(".jsonl")) return;
+	const vibeOwnedIds = await readPersistedVibeChildIds(sessionFile);
 	const root = sessionFile.slice(0, -6);
-	await registerPersistedSubagentsFromDir(registry, root, undefined);
+	await registerPersistedSubagentsFromDir(registry, root, undefined, vibeOwnedIds);
 }
 
 async function registerPersistedSubagentsFromDir(
 	registry: AgentRegistry,
 	dir: string,
 	parentId: string | undefined,
+	vibeOwnedIds: ReadonlySet<string>,
 ): Promise<void> {
 	let entries: fs.Dirent[];
 	try {
@@ -123,6 +141,7 @@ async function registerPersistedSubagentsFromDir(
 			continue;
 		}
 		const id = entry.name.slice(0, -6);
+		if (vibeOwnedIds.has(id) && registry.get(id)?.sessionFile !== sessionFile) continue;
 		if (!registry.get(id)) {
 			registry.register({
 				id,
@@ -134,7 +153,7 @@ async function registerPersistedSubagentsFromDir(
 				status: "parked",
 			});
 		}
-		await registerPersistedSubagentsFromDir(registry, path.join(dir, id), id);
+		await registerPersistedSubagentsFromDir(registry, path.join(dir, id), id, vibeOwnedIds);
 	}
 }
 
@@ -607,7 +626,7 @@ export class AgentHubOverlayComponent extends Container {
 				if (ref.status === "running" && ref.session) {
 					await ref.session.abort({ reason: USER_INTERRUPT_LABEL });
 				}
-				await this.#lifecycle().release(ref.id);
+				await this.#lifecycle().release(ref.id, ref);
 			} catch (error) {
 				logger.warn("Agent hub: kill failed", { id: ref.id, error: String(error) });
 				this.#notice = error instanceof Error ? error.message : String(error);
