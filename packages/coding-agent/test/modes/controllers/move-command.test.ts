@@ -13,13 +13,15 @@ function createMoveContext(sourceDir: string) {
 		expect(state.cwd).toBe(cwd);
 	});
 	const ctx = {
-		session: { isStreaming: false },
-		sessionManager: {
-			getCwd: () => state.cwd,
-			moveTo: vi.fn(async (cwd: string) => {
+		session: {
+			isStreaming: false,
+			moveSession: vi.fn(async (cwd: string) => {
 				state.cwd = cwd;
 				state.movedTo = cwd;
 			}),
+		},
+		sessionManager: {
+			getCwd: () => state.cwd,
 			dropSession: vi.fn(async () => {}),
 		},
 		showHookCustom: vi.fn(),
@@ -52,6 +54,7 @@ describe("CommandController /move", () => {
 			await controller.handleMoveCommand(targetDir);
 
 			expect(state.movedTo).toBe(targetDir);
+			expect(ctx.session.moveSession).toHaveBeenCalledWith(targetDir);
 			expect(ctx.sessionManager.dropSession).not.toHaveBeenCalled();
 			expect(ctx.applyCwdChange).toHaveBeenCalledWith(targetDir);
 			expect(ctx.updateEditorBorderColor).toHaveBeenCalled();

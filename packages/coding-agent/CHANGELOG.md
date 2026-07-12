@@ -100,6 +100,7 @@
 ### Fixed
 
 - Fixed advisor context maintenance to account for provider-reported cached context plus advisor prompt/tool headroom, and made overflow recovery stay at the current primary cursor, retry each overflowing update at most once on a fresh context, and keep later updates eligible.
+- Fixed persisted vibe workers disappearing or being replaced across graceful restarts, session switches, failed mode exits, and late cancelled initialization: resumable conversations now restore safely, mode exit atomically commits worker tombstones with the mode change and rolls back cleanly on storage failure, explicit kills tear workers down monotonically while repairing uncertain append tails, killed transcripts remain readable but non-revivable, and stale initializers cannot overwrite newer same-ID workers.
 
 ## [16.4.7] - 2026-07-12
 
