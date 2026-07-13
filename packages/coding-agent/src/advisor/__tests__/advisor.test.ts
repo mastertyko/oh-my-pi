@@ -2090,6 +2090,86 @@ describe("advisor", () => {
 			expect(failures).toHaveLength(2);
 		});
 
+		it("drops a terminal non-retriable assistant failure without retrying", async () => {
+			const errorMessage = "Codex error event: Request blocked. (code=invalid_prompt)";
+			const promptInputs: string[] = [];
+			const rollbackCalls: number[] = [];
+			const turnErrors: unknown[] = [];
+			const failures: unknown[] = [];
+			const events: string[] = [];
+			const state: { messages: AgentMessage[]; error?: string } = { messages: [] };
+			const agent: AdvisorAgent = {
+				prompt: async input => {
+					promptInputs.push(input);
+					events.push("prompt");
+					state.messages.push({ role: "user", content: input, timestamp: 1 } as AgentMessage);
+					const failure: AssistantMessage = {
+						role: "assistant",
+						content: [],
+						api: "openai-codex-responses",
+						provider: "openai-codex",
+						model: "gpt-5.6-sol",
+						usage: {
+							input: 1,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 1,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						stopReason: "error",
+						errorMessage,
+						errorId: 0,
+						timestamp: 2,
+					};
+					state.messages.push(failure);
+					state.error = errorMessage;
+				},
+				abort: () => {},
+				reset: () => {
+					state.messages.length = 0;
+					state.error = undefined;
+				},
+				rollbackTo: count => {
+					rollbackCalls.push(count);
+					events.push(`rollback:${count}`);
+					state.messages.length = Math.min(count, state.messages.length);
+					state.error = undefined;
+				},
+				state,
+			};
+			const messages: AgentMessage[] = [{ role: "user", content: "aaa", timestamp: 1 } as AgentMessage];
+			const host: AdvisorRuntimeHost = {
+				snapshotMessages: () => messages,
+				enqueueAdvice: () => {},
+				onTurnError: error => {
+					turnErrors.push(error);
+					events.push("hook");
+				},
+				notifyFailure: error => {
+					failures.push(error);
+					events.push("notify");
+				},
+			};
+			const runtime = new AdvisorRuntime(agent, host, 1);
+
+			runtime.onTurnEnd(messages);
+			await runtime.waitForCatchup(1000, 1);
+
+			expect(promptInputs).toHaveLength(1);
+			expect(rollbackCalls).toEqual([0]);
+			expect(turnErrors).toHaveLength(1);
+			expect(failures).toHaveLength(1);
+			expect(events).toEqual(["prompt", "rollback:0", "hook", "notify"]);
+			const turnError = turnErrors[0];
+			if (!(turnError instanceof Error)) throw new Error("expected advisor turn error");
+			expect(turnError.message).toBe(errorMessage);
+			const notifiedFailure = failures[0];
+			if (!(notifiedFailure instanceof Error)) throw new Error("expected advisor failure notification");
+			expect(notifiedFailure.message).toBe(errorMessage);
+			expect(runtime.backlog).toBe(0);
+		});
+
 		it("treats a clean prompt resolution with state.error as a failed turn (real Agent contract)", async () => {
 			// `Agent.#runLoop` catches provider/stream failures internally — it resolves
 			// `prompt()` cleanly and stores the message on `state.error` (e.g. the
@@ -2418,6 +2498,7 @@ describe("advisor", () => {
 							content: [{ type: "text", text: "" }],
 							stopReason: "error",
 							errorMessage: "404 No endpoints available",
+							errorId: AIError.create(AIError.Flag.Transient),
 							timestamp: Date.now(),
 						} as unknown as AgentMessage);
 						state.error = "404 No endpoints available";

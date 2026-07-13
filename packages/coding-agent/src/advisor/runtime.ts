@@ -608,10 +608,10 @@ export class AdvisorRuntime {
 					// never requeue it into the post-reset conversation.
 					if (this.#epoch !== epoch) continue;
 					const terminalFailure = this.#terminalAssistantFailure(messageSnapshot);
-					const contextOverflow =
-						(terminalFailure !== undefined &&
-							AIError.is(AIError.classifyMessage(terminalFailure), AIError.Flag.ContextOverflow)) ||
-						AIError.is(AIError.classify(err), AIError.Flag.ContextOverflow);
+					const failureId =
+						terminalFailure !== undefined ? AIError.classifyMessage(terminalFailure) : AIError.classify(err);
+					const contextOverflow = AIError.is(failureId, AIError.Flag.ContextOverflow);
+					const terminalFailureRetriable = terminalFailure !== undefined && AIError.retriable(failureId);
 					this.#rollbackFailedTurn(messageSnapshot);
 					logger.debug("advisor turn failed", { err: String(err) });
 					try {
@@ -652,7 +652,14 @@ export class AdvisorRuntime {
 							});
 							logger.debug("advisor context overflow recovered at current primary cursor");
 						}
-
+					} else if (terminalFailure !== undefined && !terminalFailureRetriable) {
+						logger.warn("advisor terminal failure is non-retriable; dropping bounded batch");
+						this.#notifyFailureOnce(err);
+						this.#consecutiveFailures = 0;
+						// The dropped batch may carry primary-context we never delivered; drop
+						// the seen-state too so queued raw deltas re-expand before delivery.
+						this.#clearSeenContext();
+						success = true;
 					} else {
 						this.#consecutiveFailures++;
 						if (this.#consecutiveFailures >= 3) {

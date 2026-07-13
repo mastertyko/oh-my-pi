@@ -52,6 +52,11 @@
 - Added visual markers in the transcript for elided tool calls that have no corresponding result.
 - Updated the status event log to prioritize the most recent entries in the display window.
 - Upgraded `@agentclientprotocol/sdk` to version 1.2.1.
+### Fixed
+
+- Fixed advisor turns retrying terminal non-retriable provider failures such as Codex `invalid_prompt` errors; these failures now roll back and notify immediately while transient and context-overflow recovery remain bounded.
+
+## [16.4.8] - 2026-07-12
 
 ### Fixed
 
