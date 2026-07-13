@@ -982,19 +982,17 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.session.setSessionSwitchReconciler?.(() => this.#reconcileModeFromSession({ preserveActiveGoal: true }));
 		await this.#reconcileModeFromSession();
 
-		// Brand-new sessions optionally start in plan mode when the user has made it
-		// the startup default. "Brand-new" means the resolved branch carries no
-		// conversation context (buildSessionContext().messages — covers messages,
-		// custom messages, branch summaries, and compaction summaries) and the user
-		// set no explicit `mode_change` (which #reconcileModeFromSession just
-		// restored). SDK startup metadata and extension `custom` state entries are
-		// ignored. This way `omp --continue` (or auto-resume) that finds no recent
-		// session and creates a fresh one still honors the default, while a session
-		// with restored context or an explicit mode keeps its reconciled mode. Scoped
-		// to launch (not the switch reconciler above) so /new and the plan-approval →
-		// execution handoff clear never get dragged back into plan mode. #enterPlanMode
-		// is idempotent and self-guards against an already-active plan/goal mode; it
-		// does not check plan.enabled itself.
+		// Brand-new sessions optionally start in the user's configured default mode.
+		// "Brand-new" means the resolved branch carries no conversation context
+		// (buildSessionContext().messages — covers messages, custom messages, branch
+		// summaries, and compaction summaries) and the user set no explicit
+		// `mode_change` (which #reconcileModeFromSession just restored). SDK startup
+		// metadata and extension `custom` state entries are ignored. This way
+		// `omp --continue` (or auto-resume) that finds no recent session and creates a
+		// fresh one still honors the default, while a session with restored context or
+		// an explicit mode keeps its reconciled mode. Scoped to launch (not the switch
+		// reconciler above) so /new and mode handoffs never reactivate a startup
+		// default. Plan keeps precedence when both defaults are enabled.
 		const hasConversationContext = this.sessionManager.buildSessionContext().messages.length > 0;
 		const hasExplicitMode = this.sessionManager.getEntries().some(entry => entry.type === "mode_change");
 		const isFreshSession = !hasConversationContext && !hasExplicitMode;
@@ -1004,6 +1002,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.session.settings.get("plan.enabled")
 		) {
 			await this.#enterPlanMode();
+		} else if (isFreshSession && this.session.settings.get("vibe.defaultOnStartup")) {
+			await this.#enterVibeMode();
 		}
 
 		// Restore unsent editor draft from previous session shutdown (Ctrl+D).

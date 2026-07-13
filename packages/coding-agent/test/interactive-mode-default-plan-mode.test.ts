@@ -3,10 +3,13 @@ import * as path from "node:path";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import { type Api, Effort, type Model } from "@oh-my-pi/pi-ai";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { SETTINGS_SCHEMA } from "@oh-my-pi/pi-coding-agent/config/settings-schema";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { VIBE_TOOL_NAMES } from "@oh-my-pi/pi-coding-agent/tools/vibe";
+import { VibeSessionRegistry } from "@oh-my-pi/pi-coding-agent/vibe/runtime";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
 import { ModelRegistry } from "../src/config/model-registry";
@@ -29,7 +32,7 @@ interface HarnessOptions {
 	builtInToolNames?: Iterable<string>;
 }
 
-describe("InteractiveMode plan.defaultOnStartup", () => {
+describe("InteractiveMode startup mode defaults", () => {
 	let tempDir: TempDir;
 	let authStorage: AuthStorage;
 	let mode: InteractiveMode | undefined;
@@ -41,6 +44,7 @@ describe("InteractiveMode plan.defaultOnStartup", () => {
 
 	beforeEach(async () => {
 		resetSettingsForTest();
+		VibeSessionRegistry.resetGlobalForTests();
 		tempDir = TempDir.createSync("@pi-default-plan-");
 		await Settings.init({ inMemory: true, cwd: tempDir.path() });
 		Settings.instance.set("startup.quiet", true);
@@ -52,6 +56,7 @@ describe("InteractiveMode plan.defaultOnStartup", () => {
 		vi.restoreAllMocks();
 		mode?.stop();
 		await session?.dispose();
+		VibeSessionRegistry.resetGlobalForTests();
 		authStorage?.close();
 		tempDir?.removeSync();
 		mode = undefined;
@@ -102,11 +107,33 @@ describe("InteractiveMode plan.defaultOnStartup", () => {
 			modelRegistry: registry,
 			toolRegistry,
 			builtInToolNames: options.builtInToolNames ?? ["read", "resolve"],
+			createVibeTools: () => VIBE_TOOL_NAMES.map(makeTool),
 		});
 		session = createdSession;
 		mode = new InteractiveMode(createdSession, "test");
 		return mode;
 	}
+
+	function persistedModeNames(manager: SessionManager): string[] {
+		const modes: string[] = [];
+		for (const entry of manager.getEntries()) {
+			if (entry.type === "mode_change") modes.push(entry.mode);
+		}
+		return modes;
+	}
+
+	it("exposes Vibe startup in the Modes settings with an off default", () => {
+		expect(SETTINGS_SCHEMA["vibe.defaultOnStartup"]).toMatchObject({
+			type: "boolean",
+			default: false,
+			ui: {
+				tab: "tasks",
+				group: "Modes",
+				label: "Start in Vibe Mode",
+				description: "Automatically enter Vibe mode at the start of every new interactive session",
+			},
+		});
+	});
 
 	it("enters plan mode at startup when the setting is enabled", async () => {
 		const created = createHarness(Settings.isolated({ "plan.defaultOnStartup": true, "compaction.enabled": false }));
@@ -152,13 +179,86 @@ describe("InteractiveMode plan.defaultOnStartup", () => {
 		expect(session?.getActiveToolNames()).not.toContain("write");
 	});
 
-	it("does not enter plan mode at startup by default", async () => {
+	it("does not enter a startup mode by default", async () => {
 		const created = createHarness(Settings.isolated({ "compaction.enabled": false }));
 
 		await created.init({ suppressWelcomeIntro: true });
 
 		expect(created.planModeEnabled).toBe(false);
+		expect(created.vibeModeEnabled).toBe(false);
 		expect(session?.getPlanModeState()).toBeUndefined();
+		expect(session?.getVibeModeState()).toBeUndefined();
+		expect(persistedModeNames(created.sessionManager)).toEqual([]);
+	});
+
+	it("enters Vibe mode and persists its mode change once for a fresh session", async () => {
+		const created = createHarness(Settings.isolated({ "vibe.defaultOnStartup": true, "compaction.enabled": false }));
+
+		await created.init({ suppressWelcomeIntro: true });
+
+		expect(created.vibeModeEnabled).toBe(true);
+		expect(session?.getVibeModeState()).toEqual({ enabled: true });
+		expect(session?.getActiveToolNames().toSorted()).toEqual(["read", ...VIBE_TOOL_NAMES].toSorted());
+		expect(persistedModeNames(created.sessionManager)).toEqual(["vibe"]);
+	});
+
+	it("does not enter Vibe mode when the session has restored conversation", async () => {
+		const created = createHarness(Settings.isolated({ "vibe.defaultOnStartup": true, "compaction.enabled": false }));
+		created.sessionManager.appendMessage({ role: "user", content: "prior turn", timestamp: Date.now() });
+
+		await created.init({ suppressWelcomeIntro: true });
+
+		expect(created.vibeModeEnabled).toBe(false);
+		expect(session?.getVibeModeState()).toBeUndefined();
+		expect(persistedModeNames(created.sessionManager)).toEqual([]);
+	});
+
+	it("does not enter Vibe mode after an explicit persisted mode change to none", async () => {
+		const created = createHarness(Settings.isolated({ "vibe.defaultOnStartup": true, "compaction.enabled": false }));
+		created.sessionManager.appendModeChange("none");
+
+		await created.init({ suppressWelcomeIntro: true });
+
+		expect(created.vibeModeEnabled).toBe(false);
+		expect(session?.getVibeModeState()).toBeUndefined();
+		expect(persistedModeNames(created.sessionManager)).toEqual(["none"]);
+	});
+
+	it("restores persisted Vibe mode without appending another mode change", async () => {
+		const created = createHarness(Settings.isolated({ "vibe.defaultOnStartup": true, "compaction.enabled": false }));
+		created.sessionManager.appendModeChange("vibe");
+
+		await created.init({ suppressWelcomeIntro: true });
+
+		expect(created.vibeModeEnabled).toBe(true);
+		expect(created.planModeEnabled).toBe(false);
+		expect(persistedModeNames(created.sessionManager)).toEqual(["vibe"]);
+	});
+
+	it("keeps a restored Plan mode authoritative over the Vibe startup default", async () => {
+		const created = createHarness(Settings.isolated({ "vibe.defaultOnStartup": true, "compaction.enabled": false }));
+		created.sessionManager.appendModeChange("plan", { planFilePath: "local://PLAN.md" });
+
+		await created.init({ suppressWelcomeIntro: true });
+
+		expect(created.planModeEnabled).toBe(true);
+		expect(created.vibeModeEnabled).toBe(false);
+	});
+
+	it("prefers the enabled Plan startup default when both defaults are true", async () => {
+		const created = createHarness(
+			Settings.isolated({
+				"plan.defaultOnStartup": true,
+				"vibe.defaultOnStartup": true,
+				"compaction.enabled": false,
+			}),
+		);
+
+		await created.init({ suppressWelcomeIntro: true });
+
+		expect(created.planModeEnabled).toBe(true);
+		expect(created.vibeModeEnabled).toBe(false);
+		expect(persistedModeNames(created.sessionManager)).toEqual(["plan"]);
 	});
 
 	it("does not enter plan mode when the session has restored conversation", async () => {

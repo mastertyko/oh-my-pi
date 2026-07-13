@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a `vibe.defaultOnStartup` setting (Tasks → Modes, default off) that enters Vibe mode for genuinely new interactive sessions while preserving explicit and restored session modes.
+
+### Fixed
+
+- Fixed agent-authored maintenance turns repeating a completed answer: auto-learn capture now runs in an abortable private agent with only `manage_skill` plus optional memory `learn`, leaves the primary transcript, queues, and provider anchors untouched, and defers advisor delivery until capture teardown; terminal post-compaction answers, including Cursor-resolved exec tails, no longer auto-continue.
+- Fixed advisor context maintenance to account for provider-reported cached context plus advisor prompt/tool headroom, and made overflow recovery stay at the current primary cursor, retry each overflowing update at most once on a fresh context, and keep later updates eligible.
+- Fixed persisted vibe workers disappearing or being replaced across graceful restarts, session switches, failed mode exits, and late cancelled initialization: resumable conversations now restore safely, mode exit atomically commits worker tombstones with the mode change and rolls back cleanly on storage failure, explicit kills tear workers down monotonically while repairing uncertain append tails, killed transcripts remain readable but non-revivable, and stale initializers cannot overwrite newer same-ID workers.
+- Fixed advisor turns retrying terminal non-retriable provider failures such as Codex `invalid_prompt` errors; these failures now roll back and notify immediately while transient and context-overflow recovery remain bounded.
+
 ## [16.5.1] - 2026-07-14
 
 ### Changed
@@ -52,11 +63,6 @@
 - Added visual markers in the transcript for elided tool calls that have no corresponding result.
 - Updated the status event log to prioritize the most recent entries in the display window.
 - Upgraded `@agentclientprotocol/sdk` to version 1.2.1.
-### Fixed
-
-- Fixed advisor turns retrying terminal non-retriable provider failures such as Codex `invalid_prompt` errors; these failures now roll back and notify immediately while transient and context-overflow recovery remain bounded.
-
-## [16.4.8] - 2026-07-12
 
 ### Fixed
 
@@ -102,10 +108,6 @@
 - Fixed tab reuse issues where hung navigation or unhandled modals would cause initialization to stall and trigger a force-kill
 - Improved search reliability for Perplexity provider by forcing retrieval for all queries
 - Fixed JS eval cells losing top-level `function` and `var` declarations across cells when the defining cell contained top-level `await` — the async wrapper scoped them to the cell's IIFE instead of publishing them to the worker global
-### Fixed
-
-- Fixed advisor context maintenance to account for provider-reported cached context plus advisor prompt/tool headroom, and made overflow recovery stay at the current primary cursor, retry each overflowing update at most once on a fresh context, and keep later updates eligible.
-- Fixed persisted vibe workers disappearing or being replaced across graceful restarts, session switches, failed mode exits, and late cancelled initialization: resumable conversations now restore safely, mode exit atomically commits worker tombstones with the mode change and rolls back cleanly on storage failure, explicit kills tear workers down monotonically while repairing uncertain append tails, killed transcripts remain readable but non-revivable, and stale initializers cannot overwrite newer same-ID workers.
 
 ## [16.4.7] - 2026-07-12
 
@@ -186,9 +188,6 @@
 - Fixed agents getting stuck waiting for messages from peers that have already stopped running.
 - Fixed compiled Linux binary extension loading when bundled web-search header generation cannot read `header-generator` data files from the build-time path. ([#5178](https://github.com/can1357/oh-my-pi/issues/5178))
 - Fixed plugin custom tool loading to skip and report invalid feature entries instead of crashing startup when a plugin dependency tree leaves one feature unresolved. ([#5189](https://github.com/can1357/oh-my-pi/issues/5189))
-### Fixed
-
-- Fixed agent-authored maintenance turns repeating a completed answer: auto-learn capture now runs in an abortable private agent with only `manage_skill` plus optional memory `learn`, leaves the primary transcript, queues, and provider anchors untouched, and defers advisor delivery until capture teardown; terminal post-compaction answers, including Cursor-resolved exec tails, no longer auto-continue.
 
 ## [16.4.4] - 2026-07-11
 

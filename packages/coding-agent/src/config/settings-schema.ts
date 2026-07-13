@@ -3967,6 +3967,17 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"vibe.defaultOnStartup": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tasks",
+			group: "Modes",
+			label: "Start in Vibe Mode",
+			description: "Automatically enter Vibe mode at the start of every new interactive session",
+		},
+	},
+
 	"goal.enabled": {
 		type: "boolean",
 		default: true,
