@@ -290,6 +290,81 @@ function createFakeWorkerSession(options: { streaming?: boolean; onDispose?: () 
 		},
 	};
 }
+const TEST_TEARDOWN_GRACE_MS = 50;
+
+interface BlockedSpawnMockOptions {
+	settleOnAbort?: boolean;
+	disposeGate?: Deferred;
+	rejectAfterRunGate?: boolean;
+}
+
+interface BlockedWorkerRun {
+	childSessionFile: string;
+	disposeStarted: Promise<void>;
+	gate: Deferred;
+	isDisposeFinished(): boolean;
+	isRunFinished(): boolean;
+}
+
+function installBlockedPersistedSpawnMock(options: BlockedSpawnMockOptions = {}): Map<string, BlockedWorkerRun> {
+	const runs = new Map<string, BlockedWorkerRun>();
+	vi.spyOn(executorModule, "runSubprocess").mockImplementation(async spawnOptions => {
+		const artifactsDir = spawnOptions.artifactsDir;
+		if (!artifactsDir) throw new Error("Persisted vibe test requires an artifacts directory");
+		const childSessionFile = await persistWorkerSession({
+			cwd: spawnOptions.cwd,
+			artifactsDir,
+			id: spawnOptions.id,
+			task: spawnOptions.task,
+		});
+		let disposeFinished = false;
+		let runFinished = false;
+		const disposeStarted = deferred();
+		const worker = createFakeWorkerSession({
+			onDispose: async () => {
+				disposeStarted.resolve();
+				if (options.disposeGate) await options.disposeGate.promise;
+				disposeFinished = true;
+			},
+		});
+		AgentRegistry.global().register({
+			id: spawnOptions.id,
+			displayName: spawnOptions.id,
+			kind: "sub",
+			parentId: spawnOptions.parentAgentId ?? "Main",
+			session: worker.session,
+			sessionFile: childSessionFile,
+			status: "running",
+		});
+		const gate = deferred();
+		runs.set(spawnOptions.id, {
+			childSessionFile,
+			disposeStarted: disposeStarted.promise,
+			gate,
+			isDisposeFinished: () => disposeFinished,
+			isRunFinished: () => runFinished,
+		});
+		if (options.settleOnAbort) {
+			const signal = spawnOptions.signal;
+			if (!signal) throw new Error("Blocked vibe test requires a cancellation signal");
+			const aborted = Promise.withResolvers<void>();
+			const onAbort = () => aborted.resolve();
+			if (signal.aborted) aborted.resolve();
+			else signal.addEventListener("abort", onAbort, { once: true });
+			try {
+				await aborted.promise;
+			} finally {
+				signal.removeEventListener("abort", onAbort);
+			}
+		} else {
+			await gate.promise;
+		}
+		runFinished = true;
+		if (options.rejectAfterRunGate) throw new Error("late provider cleanup failed");
+		return makeResult(spawnOptions.id, { output: "Cancelled teardown completed.", aborted: true });
+	});
+	return runs;
+}
 
 /** Scripted turn: one `read` tool call, then a successful `yield` carrying `data`. */
 function yieldTurnEvents(data: unknown): unknown[] {
@@ -422,6 +497,7 @@ describe("vibe session registry", () => {
 	});
 
 	afterEach(async () => {
+		vi.useRealTimers();
 		vi.restoreAllMocks();
 		for (const manager of managers.splice(0)) {
 			await manager.dispose({ timeoutMs: 1000 });
@@ -2072,5 +2148,235 @@ describe("vibe session registry", () => {
 		expect(registry.listIds(session)).toEqual([]);
 		expect(AgentRegistry.global().get("One")).toBeUndefined();
 		expect(AgentRegistry.global().get("Two")).toBeUndefined();
+	});
+
+	it("bounds suspension when a cancelled worker turn ignores abort", async () => {
+		const runs = installBlockedPersistedSpawnMock({ rejectAfterRunGate: true });
+		const parentManager = await createPersistedParent();
+		parentManager.appendModeChange("vibe");
+		const manager = createManager();
+		const session = createSession({ manager, sessionManager: parentManager });
+		const registry = VibeSessionRegistry.global();
+		registry.setTeardownGraceForTesting(TEST_TEARDOWN_GRACE_MS);
+		const spawned = await registry.spawn(session, {
+			cli: "fast",
+			name: "bounded-suspend",
+			prompt: INITIAL_VIBE_TASK,
+		});
+		await pollUntil(() => runs.has(spawned.id));
+		const run = runs.get(spawned.id);
+		if (!run) throw new Error("Blocked worker did not start");
+
+		vi.useFakeTimers();
+		let suspensionSettled = false;
+		let suspendedCount: number | undefined;
+		let settledBeforeDeadline = false;
+		let settledAtDeadline = false;
+		let runPendingAtDeadline = false;
+		let detachedAtDeadline = false;
+		const suspension = registry.suspendScope(registry.ownerScope(session), manager).finally(() => {
+			suspensionSettled = true;
+		});
+		try {
+			await run.disposeStarted;
+			await flushMicrotasks();
+			vi.advanceTimersByTime(TEST_TEARDOWN_GRACE_MS - 1);
+			await flushMicrotasks();
+			settledBeforeDeadline = suspensionSettled;
+			vi.advanceTimersByTime(1);
+			await flushMicrotasks();
+			await flushMicrotasks();
+			settledAtDeadline = suspensionSettled;
+			runPendingAtDeadline = !run.isRunFinished();
+			detachedAtDeadline =
+				registry.listIds(session).length === 0 && AgentRegistry.global().get(spawned.id) === undefined;
+		} finally {
+			run.gate.resolve();
+			vi.useRealTimers();
+			await manager.getJob(spawned.jobId)?.promise;
+			suspendedCount = await suspension;
+		}
+
+		expect(settledBeforeDeadline).toBe(false);
+		expect(settledAtDeadline).toBe(true);
+		expect(runPendingAtDeadline).toBe(true);
+		expect(detachedAtDeadline).toBe(true);
+		expect(suspendedCount).toBe(1);
+		expect(manager.getJob(spawned.jobId)?.status).toBe("cancelled");
+		expect(
+			parentManager.getEntries().some(entry => {
+				if (entry.type !== "custom" || typeof entry.data !== "object" || entry.data === null) return false;
+				const data = entry.data as Record<string, unknown>;
+				return data.id === spawned.id && data.action === "tombstone";
+			}),
+		).toBe(false);
+		const persisted = await SessionManager.peekSessionInit(run.childSessionFile);
+		expect(persisted?.init?.task).toBe(INITIAL_VIBE_TASK);
+	});
+
+	it("bounds explicit kill when registered-agent release ignores disposal", async () => {
+		const disposeGate = deferred();
+		const runs = installBlockedPersistedSpawnMock({ settleOnAbort: true, disposeGate });
+		const parentManager = await createPersistedParent();
+		parentManager.appendModeChange("vibe");
+		const manager = createManager();
+		const session = createSession({ manager, sessionManager: parentManager });
+		const registry = VibeSessionRegistry.global();
+		registry.setTeardownGraceForTesting(TEST_TEARDOWN_GRACE_MS);
+		const spawned = await registry.spawn(session, {
+			cli: "fast",
+			name: "bounded-kill",
+			prompt: INITIAL_VIBE_TASK,
+		});
+		await pollUntil(() => runs.has(spawned.id));
+		const run = runs.get(spawned.id);
+		if (!run) throw new Error("Blocked worker did not start");
+		const originalPeek = SessionManager.peekSessionInit;
+		const persistedSnapshot = await originalPeek(run.childSessionFile);
+		const peekSpy = vi
+			.spyOn(SessionManager, "peekSessionInit")
+			.mockImplementation((filePath, storage) =>
+				filePath === run.childSessionFile ? Promise.resolve(persistedSnapshot) : originalPeek(filePath, storage),
+			);
+
+		vi.useFakeTimers();
+		let killSettled = false;
+		let cancelledTurn: boolean | undefined;
+		let settledBeforeDeadline = false;
+		let settledAtDeadline = false;
+		let disposePendingAtDeadline = false;
+		let terminalAtDeadline = false;
+		const kill = registry.kill(session, spawned.id).finally(() => {
+			killSettled = true;
+		});
+		try {
+			await run.disposeStarted;
+			await flushMicrotasks();
+			vi.advanceTimersByTime(TEST_TEARDOWN_GRACE_MS - 1);
+			await flushMicrotasks();
+			settledBeforeDeadline = killSettled;
+			vi.advanceTimersByTime(1);
+			await flushMicrotasks();
+			await flushMicrotasks();
+			settledAtDeadline = killSettled;
+			disposePendingAtDeadline = !run.isDisposeFinished();
+			const terminalRef = AgentRegistry.global().get(spawned.id);
+			terminalAtDeadline = terminalRef?.status === "aborted" && terminalRef.session === null;
+		} finally {
+			disposeGate.resolve();
+			vi.useRealTimers();
+			cancelledTurn = (await kill).cancelledTurn;
+			await manager.getJob(spawned.jobId)?.promise;
+			peekSpy.mockRestore();
+		}
+
+		expect(settledBeforeDeadline).toBe(false);
+		expect(settledAtDeadline).toBe(true);
+		expect(disposePendingAtDeadline).toBe(true);
+		expect(terminalAtDeadline).toBe(true);
+		expect(cancelledTurn).toBe(true);
+		expect(manager.getJob(spawned.jobId)?.status).toBe("cancelled");
+		expect(AgentRegistry.global().get(spawned.id)).toMatchObject({ status: "aborted", session: null });
+		expect(
+			parentManager.getEntries().some(entry => {
+				if (entry.type !== "custom" || typeof entry.data !== "object" || entry.data === null) return false;
+				const data = entry.data as Record<string, unknown>;
+				return data.id === spawned.id && data.action === "tombstone" && data.reason === "explicit-kill";
+			}),
+		).toBe(true);
+		const persisted = await SessionManager.peekSessionInit(run.childSessionFile);
+		expect(persisted?.init?.task).toBe(INITIAL_VIBE_TASK);
+	});
+
+	it("bounds mode exit while every cancelled worker turn ignores abort", async () => {
+		const runs = installBlockedPersistedSpawnMock({ rejectAfterRunGate: true });
+		const parentManager = await createPersistedParent();
+		parentManager.appendModeChange("vibe");
+		const manager = createManager();
+		const session = createSession({ manager, sessionManager: parentManager });
+		const registry = VibeSessionRegistry.global();
+		registry.setTeardownGraceForTesting(TEST_TEARDOWN_GRACE_MS);
+		const one = await registry.spawn(session, { cli: "fast", name: "bounded-one", prompt: "One task." });
+		const two = await registry.spawn(session, { cli: "good", name: "bounded-two", prompt: "Two task." });
+		await pollUntil(() => runs.size === 2);
+		const oneRun = runs.get(one.id);
+		const twoRun = runs.get(two.id);
+		if (!oneRun || !twoRun) throw new Error("Blocked workers did not start");
+		const originalPeek = SessionManager.peekSessionInit;
+		const persistedSnapshots = new Map(
+			await Promise.all(
+				[oneRun, twoRun].map(
+					async run => [run.childSessionFile, await originalPeek(run.childSessionFile)] as const,
+				),
+			),
+		);
+		const peekSpy = vi
+			.spyOn(SessionManager, "peekSessionInit")
+			.mockImplementation((filePath, storage) =>
+				persistedSnapshots.has(filePath)
+					? Promise.resolve(persistedSnapshots.get(filePath) ?? null)
+					: originalPeek(filePath, storage),
+			);
+
+		vi.useFakeTimers();
+		let exitSettled = false;
+		let killedCount: number | undefined;
+		let settledBeforeDeadline = false;
+		let settledAtDeadline = false;
+		let turnsPendingAtDeadline = false;
+		let terminalAtDeadline = false;
+		let modeExitedAtDeadline = false;
+		const modeExit = registry.killAll(session).finally(() => {
+			exitSettled = true;
+		});
+		try {
+			await Promise.race([oneRun.disposeStarted, twoRun.disposeStarted]);
+			await flushMicrotasks();
+			vi.advanceTimersByTime(TEST_TEARDOWN_GRACE_MS - 1);
+			await flushMicrotasks();
+			settledBeforeDeadline = exitSettled;
+			vi.advanceTimersByTime(1);
+			await flushMicrotasks();
+			await flushMicrotasks();
+			await flushMicrotasks();
+			await flushMicrotasks();
+			settledAtDeadline = exitSettled;
+			turnsPendingAtDeadline = !oneRun.isRunFinished() && !twoRun.isRunFinished();
+			terminalAtDeadline = [one.id, two.id].every(id => {
+				const ref = AgentRegistry.global().get(id);
+				return ref?.status === "aborted" && ref.session === null;
+			});
+			modeExitedAtDeadline = parentManager.buildSessionContext().mode === "none";
+		} finally {
+			oneRun.gate.resolve();
+			twoRun.gate.resolve();
+			vi.useRealTimers();
+			killedCount = await modeExit;
+			await manager.getJob(one.jobId)?.promise;
+			await manager.getJob(two.jobId)?.promise;
+			peekSpy.mockRestore();
+		}
+
+		expect(settledBeforeDeadline).toBe(false);
+		expect(settledAtDeadline).toBe(true);
+		expect(turnsPendingAtDeadline).toBe(true);
+		expect(terminalAtDeadline).toBe(true);
+		expect(modeExitedAtDeadline).toBe(true);
+		expect(killedCount).toBe(2);
+		expect(registry.listIds(session)).toEqual([]);
+		expect(manager.getJob(one.jobId)?.status).toBe("cancelled");
+		expect(manager.getJob(two.jobId)?.status).toBe("cancelled");
+		for (const id of [one.id, two.id]) {
+			expect(AgentRegistry.global().get(id)).toMatchObject({ status: "aborted", session: null });
+			expect(
+				parentManager.getEntries().some(entry => {
+					if (entry.type !== "custom" || typeof entry.data !== "object" || entry.data === null) return false;
+					const data = entry.data as Record<string, unknown>;
+					return data.id === id && data.action === "tombstone" && data.reason === "mode-exit";
+				}),
+			).toBe(true);
+		}
+		expect((await SessionManager.peekSessionInit(oneRun.childSessionFile))?.init?.task).toBe("One task.");
+		expect((await SessionManager.peekSessionInit(twoRun.childSessionFile))?.init?.task).toBe("Two task.");
 	});
 });
