@@ -19,6 +19,7 @@ import { goalRenderer } from "./tools/goal";
 import { grepRenderer } from "./tools/grep";
 import { hubRenderer } from "./tools/hub";
 import { inspectImageRenderer } from "./tools/inspect-image";
+import { jobRenderer } from "./tools/job";
 import { lspRenderer } from "./tools/lsp";
 import { recallRenderer } from "./tools/memory-recall";
 import { reflectRenderer } from "./tools/memory-reflect";
@@ -55,13 +56,22 @@ const RENDERERS: Record<string, ToolRenderer> = {
 	goal: goalRenderer,
 	inspect_image: inspectImageRenderer,
 	hub: hubRenderer,
+	// Pre-hub transcript names: messaging through hub, job-family args through job.
+	irc: hubRenderer,
+	job: jobRenderer,
+	await: jobRenderer,
+	poll: jobRenderer,
+	cancel_job: jobRenderer,
 	lsp: lspRenderer,
 	recall: recallRenderer,
 	reflect: reflectRenderer,
 	retain: retainRenderer,
 	read: readRenderer,
 	report_tool_issue: reportToolIssueRenderer,
+	// xd:// resolution devices + historical top-level resolve tool.
 	resolve: resolveRenderer,
+	reject: resolveRenderer,
+	propose: resolveRenderer,
 	grep: grepRenderer,
 	search: grepRenderer,
 	task: taskRenderer,

@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed resolution cards for `xd://resolve` / `xd://reject` / `xd://propose` so action, reason, and plan metadata come from the unwrapped xdev details (and device name) instead of missing write args, restoring apply/reject/propose badge tones.
+- Registered renderer aliases for resolution devices (`reject`, `propose`), historical messaging (`irc`), and job-family transcript names (`job`, `await`, `poll`, `cancel_job`) so they reuse the intended cards instead of generic JSON.
+
 ## [17.0.0] - 2026-07-15
 
 ### Changed
