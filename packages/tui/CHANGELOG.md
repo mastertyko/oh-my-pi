@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed SIXEL encode sizing for cell heights below 6px so the 6-row band rounding no longer forces a taller encode than `maxHeightCells` reserves, and width no longer scales past the fitted column budget.
+
 ## [17.0.0] - 2026-07-15
 
 ### Added

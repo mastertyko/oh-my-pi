@@ -3,6 +3,7 @@ import { Image, ImageBudget } from "@oh-my-pi/pi-tui/components/image";
 import { getKittyGraphics, setKittyGraphics } from "@oh-my-pi/pi-tui/kitty-graphics";
 import {
 	type CellDimensions,
+	computeSixelTargetDimensions,
 	getCellDimensions,
 	ImageProtocol,
 	isWindowsTerminalPreviewSixelSupported,
@@ -185,6 +186,139 @@ describe("terminal image rendering", () => {
 		// maxHeightCells=2, targetHeightPx=18 (not 20), rows=2 — within cap.
 		expect(result?.rows).toBe(2);
 		expect((result?.sequence ?? "").startsWith("\x1bP")).toBe(true);
+	});
+
+	it("keeps SIXEL reserved rows within maxHeightCells for sub-6px cell heights", () => {
+		terminal.imageProtocol = ImageProtocol.Sixel;
+		const cellWidthPx = 10;
+		const maxWidthCells = 10;
+
+		for (const cellHeightPx of [1, 3, 4, 5, 6, 10, 18] as const) {
+			setCellDimensions({ widthPx: cellWidthPx, heightPx: cellHeightPx });
+
+			for (const maxHeightCells of [1, 2, 3] as const) {
+				// Use image pixels that exactly fill the max cell box so fit.columns /
+				// fit.rows equal the caps (avoids aspect-ratio shrink muddying the
+				// SIXEL band assertions).
+				const imageDimensions = {
+					widthPx: maxWidthCells * cellWidthPx,
+					heightPx: maxHeightCells * cellHeightPx,
+				};
+				const result = renderImage(BASE64_ONE_PIXEL_PNG, imageDimensions, {
+					maxWidthCells,
+					maxHeightCells,
+				});
+				const reservedPx = maxHeightCells * cellHeightPx;
+				const canEncodeBand = reservedPx >= 6;
+
+				if (!canEncodeBand) {
+					// No full SIXEL band fits inside the reserved height: fall back
+					// rather than force a 6px encode that would overflow the row cap.
+					expect(result).toBeNull();
+					continue;
+				}
+
+				expect(result).not.toBeNull();
+				expect(result?.rows ?? Number.POSITIVE_INFINITY).toBeLessThanOrEqual(maxHeightCells);
+				expect((result?.sequence ?? "").startsWith("\x1bP")).toBe(true);
+
+				const target = computeSixelTargetDimensions(
+					{ columns: maxWidthCells, rows: maxHeightCells },
+					{ widthPx: cellWidthPx, heightPx: cellHeightPx },
+				);
+				expect(target).not.toBeNull();
+				expect(target?.heightPx ?? 0).toBeGreaterThan(0);
+				expect((target?.heightPx ?? 1) % 6).toBe(0);
+				expect(target?.heightPx ?? Number.POSITIVE_INFINITY).toBeLessThanOrEqual(reservedPx);
+				expect(target?.widthPx ?? Number.POSITIVE_INFINITY).toBeLessThanOrEqual(maxWidthCells * cellWidthPx);
+				expect(result?.rows).toBe(target?.rows);
+			}
+		}
+	});
+
+	it("does not scale SIXEL width past the fitted column budget", () => {
+		terminal.imageProtocol = ImageProtocol.Sixel;
+		// cellH=5 / maxRows=1 reserved only 5px — old Math.max(6, floor) path
+		// forced 6px and scaled width *up*. Fall back instead of overflowing.
+		setCellDimensions({ widthPx: 10, heightPx: 5 });
+		expect(
+			renderImage(
+				BASE64_ONE_PIXEL_PNG,
+				{ widthPx: 40, heightPx: 5 },
+				{
+					maxWidthCells: 4,
+					maxHeightCells: 1,
+				},
+			),
+		).toBeNull();
+
+		// Two rows of 5px = 10px → encode height 6, scale width down (never up).
+		const imageDimensions = { widthPx: 40, heightPx: 10 };
+		const result = renderImage(BASE64_ONE_PIXEL_PNG, imageDimensions, {
+			maxWidthCells: 4,
+			maxHeightCells: 2,
+		});
+		const target = computeSixelTargetDimensions({ columns: 4, rows: 2 }, { widthPx: 10, heightPx: 5 });
+		expect(result).not.toBeNull();
+		expect(result?.rows).toBeLessThanOrEqual(2);
+		expect(target).toEqual({ widthPx: 24, heightPx: 6, rows: 2 });
+		expect(target?.widthPx ?? Number.POSITIVE_INFINITY).toBeLessThanOrEqual(40);
+	});
+
+	it("handles tall, wide, and degenerate SIXEL geometry without overflowing", () => {
+		terminal.imageProtocol = ImageProtocol.Sixel;
+		setCellDimensions({ widthPx: 10, heightPx: 18 });
+
+		const tall = renderImage(
+			BASE64_ONE_PIXEL_PNG,
+			{ widthPx: 10, heightPx: 1000 },
+			{
+				maxWidthCells: 5,
+				maxHeightCells: 3,
+			},
+		);
+		expect(tall).not.toBeNull();
+		expect(tall?.rows).toBeLessThanOrEqual(3);
+
+		const wide = renderImage(
+			BASE64_ONE_PIXEL_PNG,
+			{ widthPx: 1000, heightPx: 10 },
+			{
+				maxWidthCells: 8,
+				maxHeightCells: 4,
+			},
+		);
+		expect(wide).not.toBeNull();
+		expect(wide?.rows).toBeLessThanOrEqual(4);
+
+		// Non-positive / non-finite geometry is rejected by the SIXEL path.
+		expect(computeSixelTargetDimensions({ columns: 4, rows: 2 }, { widthPx: 10, heightPx: 0 })).toBeNull();
+		expect(computeSixelTargetDimensions({ columns: 4, rows: 2 }, { widthPx: 0, heightPx: 18 })).toBeNull();
+		expect(computeSixelTargetDimensions({ columns: 0, rows: 2 }, { widthPx: 10, heightPx: 18 })).toBeNull();
+		expect(computeSixelTargetDimensions({ columns: 4, rows: 0 }, { widthPx: 10, heightPx: 18 })).toBeNull();
+		expect(computeSixelTargetDimensions({ columns: Number.NaN, rows: 2 }, { widthPx: 10, heightPx: 18 })).toBeNull();
+		expect(computeSixelTargetDimensions({ columns: 4, rows: Number.NaN }, { widthPx: 10, heightPx: 18 })).toBeNull();
+		expect(computeSixelTargetDimensions({ columns: 4, rows: 2 }, { widthPx: Number.NaN, heightPx: 18 })).toBeNull();
+		expect(computeSixelTargetDimensions({ columns: 4, rows: 2 }, { widthPx: 10, heightPx: Number.NaN })).toBeNull();
+		expect(
+			computeSixelTargetDimensions({ columns: Number.POSITIVE_INFINITY, rows: 2 }, { widthPx: 10, heightPx: 18 }),
+		).toBeNull();
+		expect(
+			computeSixelTargetDimensions({ columns: 4, rows: Number.POSITIVE_INFINITY }, { widthPx: 10, heightPx: 18 }),
+		).toBeNull();
+		expect(
+			computeSixelTargetDimensions({ columns: 4, rows: 2 }, { widthPx: Number.POSITIVE_INFINITY, heightPx: 18 }),
+		).toBeNull();
+		expect(
+			computeSixelTargetDimensions({ columns: 4, rows: 2 }, { widthPx: 10, heightPx: Number.POSITIVE_INFINITY }),
+		).toBeNull();
+
+		// Fractional positive cell sizes are kept; fit columns/rows floor to whole cells.
+		expect(computeSixelTargetDimensions({ columns: 4.8, rows: 2.9 }, { widthPx: 10.5, heightPx: 18.5 })).toEqual({
+			widthPx: 41,
+			heightPx: 36,
+			rows: 2,
+		});
 	});
 
 	it("moves back up before multi-row direct Kitty output and restores the cursor below it", () => {

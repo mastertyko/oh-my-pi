@@ -728,6 +728,67 @@ export function calculateImageRows(
 	return Math.max(1, rows);
 }
 
+/** SIXEL encodes pixels in vertical bands of this many rows. */
+const SIXEL_BAND_PX = 6;
+
+/**
+ * Compute SIXEL encode pixel size for a fitted cell box.
+ *
+ * SIXEL pads height up to the next multiple of {@link SIXEL_BAND_PX} at the
+ * terminal. To keep the reserved row count from exceeding `fit.rows`, encode
+ * height is the largest multiple of 6 that does not exceed the reserved pixel
+ * height. Width is scaled by the same ratio (and never above the fitted width)
+ * so aspect ratio is preserved without growing past the fit box. When no full
+ * band fits (reserved height < 6px) or geometry is non-finite/non-positive,
+ * returns null so the caller can fall back instead of overflowing the row cap.
+ */
+export function computeSixelTargetDimensions(
+	fit: { columns: number; rows: number },
+	cellDims: CellDimensions,
+): { widthPx: number; heightPx: number; rows: number } | null {
+	// Reject non-finite / non-positive inputs before arithmetic so NaN and
+	// Infinity cannot propagate into encode dimensions. Fractional positive
+	// cell sizes are kept; fractional fit columns/rows are floored to whole
+	// cells after the finite check.
+	if (
+		!Number.isFinite(fit.columns) ||
+		!Number.isFinite(fit.rows) ||
+		!Number.isFinite(cellDims.widthPx) ||
+		!Number.isFinite(cellDims.heightPx) ||
+		fit.columns <= 0 ||
+		fit.rows <= 0 ||
+		cellDims.widthPx <= 0 ||
+		cellDims.heightPx <= 0
+	) {
+		return null;
+	}
+
+	const columns = Math.floor(fit.columns);
+	const fitRows = Math.floor(fit.rows);
+	if (columns <= 0 || fitRows <= 0) {
+		return null;
+	}
+
+	const cellWidthPx = cellDims.widthPx;
+	const cellHeightPx = cellDims.heightPx;
+	const rawHeightPx = fitRows * cellHeightPx;
+	// Floor only — never force a full 6px band when the reserved height is
+	// smaller. Math.max(6, floor(...)) would encode 6px for e.g. cellH=5 /
+	// maxRows=1 (5px reserved), which ceil()s to 2 rows and can also scale
+	// width *up* past the fitted column budget.
+	const targetHeightPx = Math.floor(rawHeightPx / SIXEL_BAND_PX) * SIXEL_BAND_PX;
+	if (targetHeightPx < SIXEL_BAND_PX) {
+		return null;
+	}
+
+	const heightScale = targetHeightPx / rawHeightPx;
+	const maxWidthPx = Math.max(1, Math.round(columns * cellWidthPx));
+	const targetWidthPx = Math.min(maxWidthPx, Math.max(1, Math.round(columns * cellWidthPx * heightScale)));
+	const rows = Math.min(fitRows, Math.max(1, Math.ceil(targetHeightPx / cellHeightPx)));
+
+	return { widthPx: targetWidthPx, heightPx: targetHeightPx, rows };
+}
+
 function calculateImageFit(
 	imageDimensions: ImageDimensions,
 	options: ImageRenderOptions,
@@ -952,25 +1013,13 @@ export function renderImage(
 
 	if (TERMINAL.imageProtocol === ImageProtocol.Sixel) {
 		try {
-			// SIXEL encodes in 6-pixel vertical bands. A height that is not a
-			// multiple of 6 is padded with transparent rows, but the terminal
-			// still allocates cell rows for the padded height. When the padded
-			// height crosses a cell boundary the terminal uses one more row
-			// than fit.rows, so the next line of content overwrites the bottom
-			// of the image — a visible slice stripped from the image. Round the
-			// encode height DOWN to the largest multiple of 6 that fits within
-			// the requested row budget, so the band boundary aligns without
-			// padding and the reserved row count never exceeds fit.rows. Scale
-			// the width by the same ratio so resize_exact preserves the aspect
-			// ratio instead of squashing the image vertically.
-			const rawHeightPx = Math.max(1, fit.rows * cellDims.heightPx);
-			const targetHeightPx = Math.max(6, Math.floor(rawHeightPx / 6) * 6);
-			const heightScale = targetHeightPx / rawHeightPx;
-			const targetWidthPx = Math.max(1, Math.round(fit.columns * cellDims.widthPx * heightScale));
-			const rows = Math.max(1, Math.ceil(targetHeightPx / cellDims.heightPx));
+			const target = computeSixelTargetDimensions(fit, cellDims);
+			if (!target) {
+				return null;
+			}
 			const decoded = new Uint8Array(Buffer.from(base64Data, "base64"));
-			const sequence = encodeSixel(decoded, targetWidthPx, targetHeightPx);
-			return { sequence, rows };
+			const sequence = encodeSixel(decoded, target.widthPx, target.heightPx);
+			return { sequence, rows: target.rows };
 		} catch {
 			return null;
 		}
