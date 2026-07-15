@@ -352,7 +352,30 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		let heartbeatTimer: NodeJS.Timeout | null = null;
 		let debugResponseLogPromise: Promise<RequestDebugResponseLog | undefined> | undefined;
 		const h2Completion = Promise.withResolvers<void>();
-		let resolveH2: (() => void) | undefined = h2Completion.resolve;
+		let h2Settled = false;
+		let sawTurnEnded = false;
+		let endStreamError: Error | null = null;
+		const settleH2 = (error?: unknown): void => {
+			if (h2Settled) return;
+			h2Settled = true;
+			if (error !== undefined) {
+				h2Completion.reject(error);
+				return;
+			}
+			if (endStreamError) {
+				h2Completion.reject(endStreamError);
+				return;
+			}
+			if (!sawTurnEnded) {
+				h2Completion.reject(
+					new AIError.ProviderResponseError("Cursor stream ended before turnEnded", {
+						kind: "incomplete-stream",
+					}),
+				);
+				return;
+			}
+			h2Completion.resolve();
+		};
 
 		try {
 			const apiKey = options?.apiKey;
@@ -408,14 +431,13 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			} else {
 				h2Client = http2.connect(baseUrl);
 			}
-			h2Client.on("error", h2Completion.reject);
+			h2Client.on("error", error => settleH2(error));
 
 			h2Request = h2Client.request(requestHeaders);
 
 			stream.push({ type: "start", partial: output });
 
 			let pendingBuffer = Buffer.alloc(0);
-			let endStreamError: Error | null = null;
 			let currentTextBlock: (TextContent & { [kStreamingBlockIndex]: number }) | null = null;
 			let currentThinkingBlock: (ThinkingContent & { [kStreamingBlockIndex]: number }) | null = null;
 			let currentToolCall: ToolCallState | null = null;
@@ -505,12 +527,10 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 							log("error", "handleServerMessage", { error: String(error) });
 						});
 
-						// Resolve only on explicit turnEnded. stopReason defaults to "stop"
-						// and is not a reliable signal for stream completion.
-						if (isTurnEnded && resolveH2) {
-							const r = resolveH2;
-							resolveH2 = undefined;
-							r();
+						// Mark turnEnded only. Protocol success still requires a clean
+						// stream end so later CONNECT/gRPC trailer errors can reject.
+						if (isTurnEnded) {
+							sawTurnEnded = true;
 						}
 					} catch (e) {
 						log("error", "parseServerMessage", { error: String(e) });
@@ -537,40 +557,33 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			h2Request.on("trailers", trailers => {
 				const status = trailers["grpc-status"];
 				const msg = trailers["grpc-message"];
-				if (status && status !== "0") {
-					void closeDebugLog().finally(() => {
-						h2Completion.reject(
-							new AIError.ProviderResponseError(
-								`gRPC error ${status}: ${decodeURIComponent(String(msg || ""))}`,
-								{ kind: "envelope" },
-							),
-						);
-					});
+				// Capture trailer failures for settle on stream end so a later
+				// CONNECT/gRPC error still rejects even after turnEnded.
+				if (status && status !== "0" && !endStreamError) {
+					endStreamError = new AIError.ProviderResponseError(
+						`gRPC error ${status}: ${decodeURIComponent(String(msg || ""))}`,
+						{ kind: "envelope" },
+					);
 				}
 			});
 
 			h2Request.on("end", () => {
-				resolveH2 = undefined;
 				void closeDebugLog()
 					.then(() => {
-						if (endStreamError) {
-							h2Completion.reject(endStreamError);
-							return;
-						}
-						h2Completion.resolve();
+						settleH2();
 					})
-					.catch(h2Completion.reject);
+					.catch(error => settleH2(error));
 			});
 
 			h2Request.on("error", error => {
-				void closeDebugLog().finally(() => h2Completion.reject(error));
+				void closeDebugLog().finally(() => settleH2(error));
 			});
 
 			if (options?.signal) {
 				options.signal.addEventListener("abort", () => {
 					h2Request?.close();
 					void closeDebugLog().finally(() => {
-						h2Completion.reject(new AIError.AbortError());
+						settleH2(new AIError.AbortError());
 					});
 				});
 			}

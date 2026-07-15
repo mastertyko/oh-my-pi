@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Cursor streams resolving at `turnEnded` before CONNECT end-stream or gRPC trailer errors could reject, so `done` is emitted only after a clean protocol terminal and post-turn failures surface as stream errors.
+
 ## [17.0.0] - 2026-07-15
 
 ### Changed
