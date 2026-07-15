@@ -36,7 +36,7 @@ import {
 	writeArchive,
 } from "../utils/zip";
 import { routeWriteThroughBridge } from "./acp-bridge";
-import { truncateForPrompt } from "./approval";
+import { getToolApprovalDecision, truncateForPrompt } from "./approval";
 import { assertEditableFile } from "./auto-generated-guard";
 import {
 	type ConflictEntry,
@@ -390,7 +390,8 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		// Unwrap a hashline `[path#TAG]` wrapper first (parity with execute) so a
 		// wrapped `[ssh://h/x#ABCD]` can't dodge scheme detection and the tier checks below.
 		const path = unwrapHashlineHeaderPath(rawPath);
-		// xd:// device writes execute the mounted tool — take its approval tier.
+		// xd:// device writes execute the mounted tool — take its approval tier,
+		// evaluating function-valued approvals against the parsed device args.
 		// The resolution devices (xd://resolve, xd://reject, xd://propose)
 		// finalize a staged, already-previewed action, so they stay at read tier.
 		const xdevTarget = parseXdUrl(path);
@@ -398,9 +399,14 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			if (xdevTarget.name === REPORT_ISSUE_DEVICE_NAME) return "write";
 			if (xdevTarget.name && isResolutionDeviceName(xdevTarget.name)) return "read";
 			const inst = xdevTarget.name ? this.session.xdevRegistry?.get(xdevTarget.name) : undefined;
-			const decision = typeof inst?.approval === "function" ? undefined : inst?.approval;
-			const tier = typeof decision === "object" ? decision?.tier : decision;
-			return tier ?? "exec";
+			if (!inst) return "exec";
+			const content = (args as Partial<WriteParams>).content;
+			const deviceArgs =
+				typeof content === "string" && content.length > 0 ? tryParseDeviceApprovalArgs(content) : undefined;
+			// Fail closed: malformed JSON / non-object content cannot be evaluated
+			// against a function-valued approval, so keep the outer gate at exec.
+			if (deviceArgs === null) return "exec";
+			return getToolApprovalDecision(inst, deviceArgs ?? {}).tier;
 		}
 		// Remote SSH writes open an outbound connection and run a remote shell —
 		// gate them like the exec-tier `ssh` tool, ahead of the handler-write
@@ -1007,7 +1013,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 									return;
 								}
 								const registry = this.session.xdevRegistry;
-								if (!registry || registry.size === 0) {
+								if (!registry) {
 									throw new ToolError("xd:// is not mounted in this session.");
 								}
 								if (!name) {
@@ -1323,6 +1329,21 @@ function renderContentPreview(
 	});
 }
 
+/**
+ * Best-effort parse of a device write's JSON content for outer approval only.
+ * Returns `null` when the payload is present but not a JSON object (fail closed
+ * to exec). Does not schema-validate — that happens at dispatch.
+ */
+function tryParseDeviceApprovalArgs(content: string): Record<string, unknown> | null {
+	try {
+		const parsed: unknown = JSON.parse(content);
+		if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+		return parsed as Record<string, unknown>;
+	} catch {
+		return null;
+	}
+}
+
 /** Render context for the write tool: resolves an `xd://`-mounted tool so its live renderer drives device dispatch previews. */
 export interface WriteRenderContext {
 	resolveXdevMounted?: (name: string) => AgentTool | undefined;
@@ -1336,19 +1357,26 @@ export const writeToolRenderer = {
 	): Component | undefined {
 		const rawPath =
 			typeof args.file_path === "string" ? args.file_path : typeof args.path === "string" ? args.path : "";
-		// Render NOTHING until the streamed path arrives and provably is not an
-		// xd:// device; xd:// writes then delegate to the mounted tool's renderer.
+		// Render NOTHING until the streamed path arrives and either is provably
+		// not an xd:// device, or is a settled xd:// device (content started).
+		// Partial prefixes that could still become xd:// stay blank so the user
+		// never sees a half-typed "xd://ast_" frame; settled ordinary paths that
+		// only shared a prefix ("x", "xd", "xd:", "xd:/") render as normal writes.
 		// A present-but-malformed path (array/object from a bad provider parse)
 		// is definitively not xd:// — fall through to the legacy frame.
 		if (args.path === undefined && args.file_path === undefined) return undefined;
 		if (rawPath && couldBecomeXdUrl(rawPath)) {
 			const xdev = parseXdUrl(rawPath);
-			// The path string is settled once the content field started streaming.
+			// Path is settled once the content field started streaming.
 			const pathSettled = args.content !== undefined;
-			if (!xdev?.name || !pathSettled) return undefined;
-			if (isResolutionDeviceName(xdev.name)) return renderResolutionDeviceCall(xdev.name, args.content, uiTheme);
-			if (xdev.name === REPORT_ISSUE_DEVICE_NAME) return renderReportIssueDeviceCall(args.content, uiTheme);
-			return renderXdevCall(xdev.name, args.content, options, uiTheme, options.renderContext?.resolveXdevMounted);
+			if (!pathSettled) return undefined;
+			if (xdev) {
+				if (!xdev.name) return undefined;
+				if (isResolutionDeviceName(xdev.name)) return renderResolutionDeviceCall(xdev.name, args.content, uiTheme);
+				if (xdev.name === REPORT_ISSUE_DEVICE_NAME) return renderReportIssueDeviceCall(args.content, uiTheme);
+				return renderXdevCall(xdev.name, args.content, options, uiTheme, options.renderContext?.resolveXdevMounted);
+			}
+			// Settled non-device path that shared a prefix with xd:// — fall through.
 		}
 		const filePath = shortenPath(rawPath);
 		const lang = rawPath ? (getLanguageFromPath(rawPath) ?? "text") : "text";

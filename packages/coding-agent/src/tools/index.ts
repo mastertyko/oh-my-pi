@@ -566,9 +566,10 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 	);
 	let tools = baseResults.filter((r): r is Tool => r !== null);
 
-	// xd:// mounting: unmount discoverable built-ins from the tools array and
-	// expose them as virtual device URLs driven through read/write. Active for
-	// default tool sets when `tools.xdev` is enabled.
+	// xd:// mounting: unmount discoverable built-ins from the top-level tools
+	// array and seed the device catalog. Active for default tool sets when
+	// `tools.xdev` is enabled. Later active-set changes reconcile the enabled
+	// mounts (including revoking built-ins omitted from the active set).
 	const xdevEnabled = requestedTools === undefined && session.settings.get("tools.xdev");
 	if (xdevEnabled) {
 		const mounted: Tool[] = [];

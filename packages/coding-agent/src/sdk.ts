@@ -2207,10 +2207,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			wrapToolWithMetaNotice,
 		);
 
-		// All built-in tools are active (conditional tools like git/ask return null from factory if disabled)
+		// All built-in tools are active (conditional tools like git/ask return null from factory if disabled).
+		// Discoverable built-ins mounted under xd:// are omitted from createTools' return value — re-register
+		// them from the device catalog so active-set selection can enable/disable them (and so a restricted
+		// set can revoke device dispatch instead of leaving built-ins permanently callable).
 		const builtInRegistryToolNames = new Set<string>();
 		const toolRegistry = new Map<string, Tool>();
 		for (const tool of builtinTools) {
+			toolRegistry.set(tool.name, tool);
+			builtInRegistryToolNames.add(tool.name);
+		}
+		for (const tool of toolSession.xdevRegistry?.list() ?? []) {
+			if (toolRegistry.has(tool.name)) continue;
 			toolRegistry.set(tool.name, tool);
 			builtInRegistryToolNames.add(tool.name);
 		}
@@ -2447,11 +2455,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		hasRegistered = true;
 
 		// Partition the initial enabled set for the xd:// transport: discoverable
-		// tools become mounted devices; the rest stay top-level. The registry
-		// already holds the built-in devices (mounted in createTools); this
-		// reconciles the initial dynamic mounts (image-gen, TTS, startup MCP,
-		// active extension tools) and drops them from the top-level names so they
-		// never ship a schema. Presentation only — selection already happened.
+		// tools become mounted devices; the rest stay top-level. Reconcile replaces
+		// the full active mount set (built-ins + dynamics) from this selection and
+		// drops them from the top-level names so they never ship a schema.
+		// Presentation only — selection already happened.
 		let initialMountedXdevToolNames: string[] = [];
 		if (toolSession.xdevRegistry) {
 			const topLevelToolNames: string[] = [];

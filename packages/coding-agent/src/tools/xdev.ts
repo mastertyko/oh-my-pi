@@ -166,48 +166,65 @@ const HELP_CONTENT_RE = /^\s*(\?|help)?\s*$/i;
 
 /**
  * Registry of tools mounted under `xd://` for one session. `createTools`
- * mounts discoverable built-ins first; SDK assembly adds custom tools that do
- * not opt out. `read`/`write` consult it at execute time.
+ * seeds the built-in device catalog; SDK assembly and active-tool changes
+ * call {@link reconcile} with the currently enabled mountable tools.
+ * Listing, docs, and dispatch only see the active set — a tool omitted from
+ * the active set is not discoverable or callable through `xd://`.
  */
 export class XdevRegistry {
-	/** Discoverable built-ins mounted at construction; never reconciled away. */
+	/**
+	 * Built-in device catalog (discoverable built-ins from `createTools`).
+	 * Identity only: used for docs treatment and stable catalog order. A
+	 * catalog entry is not callable unless it is also in {@link #active}.
+	 */
 	#builtins = new Map<string, Tool>();
 	/**
-	 * Dynamic mounts (custom, MCP, extension, autoresearch) — replaced wholesale
-	 * by {@link reconcile} as the active tool set changes, so a deactivated or
-	 * disconnected tool is no longer callable through a stale device.
+	 * Currently enabled mounts (built-ins + custom/MCP/extension). Replaced
+	 * wholesale by {@link reconcile} as the active tool set changes, so a
+	 * deactivated or disconnected tool is no longer callable through a stale
+	 * device.
 	 */
-	#dynamic = new Map<string, Tool>();
+	#active = new Map<string, Tool>();
 
 	constructor(builtins: Iterable<Tool>) {
-		for (const tool of builtins) this.#builtins.set(tool.name, tool);
+		for (const tool of builtins) {
+			this.#builtins.set(tool.name, tool);
+			this.#active.set(tool.name, tool);
+		}
 	}
 
 	/**
-	 * Replace the dynamic mount set while preserving the built-in devices. Order
-	 * follows `tools`; names absent from it are dropped. A built-in device is
-	 * never shadowed by a same-named dynamic entry.
+	 * Replace the entire active mount set. Order follows `tools`. Names absent
+	 * from it are dropped from listing/docs/dispatch, including built-ins that
+	 * were previously enabled. Built-in catalog identity is preserved so a later
+	 * re-enable restores curated-docs treatment.
 	 */
 	reconcile(tools: Iterable<Tool>): void {
 		const next = new Map<string, Tool>();
-		for (const tool of tools) {
-			if (this.#builtins.has(tool.name)) continue;
-			next.set(tool.name, tool);
-		}
-		this.#dynamic = next;
+		for (const tool of tools) next.set(tool.name, tool);
+		this.#active = next;
 	}
 
 	get size(): number {
-		return this.#builtins.size + this.#dynamic.size;
+		return this.#active.size;
 	}
 
-	/** Mounted tools in catalog order: built-ins first, then dynamic mounts. */
+	/** Currently enabled tools in catalog order: known built-ins first, then the rest. */
 	list(): readonly Tool[] {
-		return [...this.#builtins.values(), ...this.#dynamic.values()];
+		const dynamic: Tool[] = [];
+		const builtins: Tool[] = [];
+		for (const tool of this.#active.values()) {
+			if (this.#builtins.has(tool.name)) builtins.push(tool);
+			else dynamic.push(tool);
+		}
+		// Preserve constructor / reconcile insertion order within each group.
+		const builtinOrder = [...this.#builtins.keys()];
+		builtins.sort((a, b) => builtinOrder.indexOf(a.name) - builtinOrder.indexOf(b.name));
+		return [...builtins, ...dynamic];
 	}
 
 	get(name: string): Tool | undefined {
-		return this.#builtins.get(name) ?? this.#dynamic.get(name);
+		return this.#active.get(name);
 	}
 
 	/** `{name, summary}` pairs for prompt templates and /tools display. */
@@ -241,10 +258,11 @@ export class XdevRegistry {
 	/** A single device's docs above this size never inline: one pathological
 	 *  MCP description must not starve every later device. */
 	static readonly DOCS_PER_DEVICE_CAP = 10_000;
-	/** Description cap for EXTERNAL devices (dynamic mounts: MCP, custom,
-	 *  extension, …) in the system-prompt embedding. Built-in devices inline
-	 *  their full curated docs; external descriptions are server-controlled
-	 *  prose the model can re-fetch, so only the lede earns prompt space. */
+	/** Description cap for EXTERNAL devices (not in the built-in catalog:
+	 *  MCP, custom, extension, …) in the system-prompt embedding. Built-in
+	 *  devices inline their full curated docs; external descriptions are
+	 *  server-controlled prose the model can re-fetch, so only the lede earns
+	 *  prompt space. */
 	static readonly EXTERNAL_DESCRIPTION_CAP = 200;
 
 	/**
@@ -260,7 +278,7 @@ export class XdevRegistry {
 		const overflow: Tool[] = [];
 		let used = 0;
 		for (const tool of this.list()) {
-			const descriptionCap = this.#dynamic.has(tool.name) ? XdevRegistry.EXTERNAL_DESCRIPTION_CAP : undefined;
+			const descriptionCap = this.#builtins.has(tool.name) ? undefined : XdevRegistry.EXTERNAL_DESCRIPTION_CAP;
 			const docs = renderDocs(tool, "##", descriptionCap);
 			if (docs.length > XdevRegistry.DOCS_PER_DEVICE_CAP || used + docs.length > XdevRegistry.DOCS_TOTAL_BUDGET) {
 				overflow.push(tool);

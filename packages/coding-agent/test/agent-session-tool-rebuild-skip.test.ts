@@ -42,6 +42,14 @@ function createBasicTool(name: string, label: string, description = `${label} to
 	};
 }
 
+/** Built-in-style discoverable tool that mounts under xd:// when xdev is active. */
+function createDiscoverableTool(name: string, label: string, description = `${label} tool`): AgentTool {
+	return {
+		...createBasicTool(name, label, description),
+		loadMode: "discoverable",
+	};
+}
+
 function createMcpCustomTool(name: string, serverName: string, mcpToolName: string, description: string): CustomTool {
 	return {
 		name,
@@ -70,6 +78,12 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		getMcpServerInstructions?: () => Map<string, string> | undefined;
 		getLocalCalendarDate?: () => string;
 		xdevRegistry?: XdevRegistry;
+		/** Extra tools registered in the session tool map (e.g. built-in discoverables). */
+		extraTools?: AgentTool[];
+		/** Names already mounted under xd:// at session construction (startup partition). */
+		initialMountedXdevToolNames?: string[];
+		/** When set, overrides the default initial top-level agent tools. */
+		initialTopLevelTools?: AgentTool[];
 	}
 
 	function newSession(
@@ -84,14 +98,19 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 			[readTool.name, readTool],
 			[initialMcp.name, initialMcp as unknown as AgentTool],
 		]);
+		for (const tool of options.extraTools ?? []) {
+			toolRegistry.set(tool.name, tool);
+		}
+		const initialTopLevel = options.initialTopLevelTools ?? [readTool, initialMcp as unknown as AgentTool];
 		const agent = new Agent({
 			initialState: {
 				model: createModel(),
 				systemPrompt: ["initial"],
-				tools: [readTool, initialMcp as unknown as AgentTool],
+				tools: initialTopLevel,
 				messages: [],
 			},
 		});
+		const xdevRegistry = options.xdevRegistry;
 		const session = new AgentSession({
 			agent,
 			sessionManager: SessionManager.inMemory(),
@@ -103,7 +122,9 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 			}),
 			getMcpServerInstructions: options.getMcpServerInstructions,
 			getLocalCalendarDate: options.getLocalCalendarDate,
-			xdevRegistry: options.xdevRegistry,
+			xdevRegistry,
+			initialMountedXdevToolNames: options.initialMountedXdevToolNames,
+			getXdevToolEntries: () => xdevRegistry?.entries() ?? [],
 		});
 		sessions.push(session);
 		return { session };
@@ -548,5 +569,111 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		await session.refreshMCPTools([search]);
 		expect(rebuildCount).toBe(1);
 		expect(noticeTexts().length).toBe(noticeCount);
+	});
+
+	it("setActiveToolsByName revokes and re-enables built-in xd:// devices end-to-end", async () => {
+		// Real registry + tool map: discoverable built-ins start mounted (startup
+		// partition), then setActiveToolsByName drives revoke/re-enable — not a
+		// direct registry.reconcile call.
+		const astEdit = createDiscoverableTool("ast_edit", "AST Edit", "Structural AST rewrites");
+		const debug = createDiscoverableTool("debug", "Debug", "DAP debugger control");
+		const readTool = createBasicTool("read", "Read");
+		const registry = new XdevRegistry([astEdit, debug]);
+		const noticeTexts = (session: AgentSession) =>
+			session.agent
+				.peekSteeringQueue()
+				.flatMap(msg =>
+					msg.role === "custom" && msg.customType === "xdev-mount-notice" && typeof msg.content === "string"
+						? [msg.content]
+						: [],
+				);
+
+		let rebuildCount = 0;
+		const { session } = newSession(
+			async toolNames => {
+				rebuildCount++;
+				return `tools:${toolNames.join(",")}`;
+			},
+			{
+				xdevRegistry: registry,
+				extraTools: [astEdit, debug],
+				initialMountedXdevToolNames: ["ast_edit", "debug"],
+				// Top-level only: discoverables are already devices, not schemas.
+				initialTopLevelTools: [readTool],
+			},
+		);
+
+		// Construction does not emit a mount delta notice.
+		expect(noticeTexts(session)).toEqual([]);
+		expect(session.getMountedXdevToolNames().sort()).toEqual(["ast_edit", "debug"]);
+		expect(
+			registry
+				.list()
+				.map(tool => tool.name)
+				.sort(),
+		).toEqual(["ast_edit", "debug"]);
+		expect(registry.listing()).toContain("xd://ast_edit");
+		expect(registry.docs("ast_edit")).toContain("# ast_edit");
+		const initialHelp = await registry.dispatch("ast_edit", "?", "tc-help");
+		expect(initialHelp.xdev.mode).toBe("help");
+		expect(initialHelp.result.content.find(entry => entry.type === "text")?.text).toContain("# ast_edit");
+
+		// Restrict to read-only top-level tools: both built-in devices must drop.
+		await session.setActiveToolsByName(["read"]);
+		expect(session.getActiveToolNames()).toEqual(["read"]);
+		expect(session.getMountedXdevToolNames()).toEqual([]);
+		expect(session.getEnabledToolNames()).toEqual(["read"]);
+		expect(registry.size).toBe(0);
+		expect(registry.list()).toEqual([]);
+		expect(registry.listing()).toContain("0 mounted tool devices");
+		expect(registry.listing()).not.toContain("xd://ast_edit");
+		expect(() => registry.docs("ast_edit")).toThrow(/No such tool device: xd:\/\/ast_edit/);
+		await expect(registry.dispatch("ast_edit", "?", "tc-revoked")).rejects.toThrow(
+			/No such tool device: xd:\/\/ast_edit/,
+		);
+		const revokeNotice = noticeTexts(session).at(-1) ?? "";
+		expect(revokeNotice).toContain("No longer mounted");
+		expect(revokeNotice).toContain("xd://ast_edit");
+		expect(revokeNotice).toContain("xd://debug");
+		expect(revokeNotice).not.toContain("became available");
+		// Active-set shrink rebuilds the top-level prompt once.
+		expect(rebuildCount).toBe(1);
+
+		// Re-enable only ast_edit: list/docs/dispatch restore for it; debug stays out.
+		const noticeCountAfterRevoke = noticeTexts(session).length;
+		await session.setActiveToolsByName(["read", "ast_edit"]);
+		expect(session.getActiveToolNames()).toEqual(["read"]);
+		expect(session.getMountedXdevToolNames()).toEqual(["ast_edit"]);
+		expect(session.getEnabledToolNames().sort()).toEqual(["ast_edit", "read"]);
+		expect(registry.list().map(tool => tool.name)).toEqual(["ast_edit"]);
+		expect(registry.get("debug")).toBeUndefined();
+		expect(registry.listing()).toContain("xd://ast_edit");
+		expect(registry.listing()).not.toContain("xd://debug");
+		expect(registry.docs("ast_edit")).toContain("# ast_edit");
+		expect(() => registry.docs("debug")).toThrow(/No such tool device: xd:\/\/debug/);
+		const restored = await registry.dispatch("ast_edit", JSON.stringify({ value: "ok" }), "tc-restored");
+		expect(restored.xdev.mode).toBe("execute");
+		expect(restored.result.content.find(entry => entry.type === "text")?.text).toBe("ast_edit executed");
+		await expect(registry.dispatch("debug", "?", "tc-debug-still-revoked")).rejects.toThrow(
+			/No such tool device: xd:\/\/debug/,
+		);
+		const restoreNotice = noticeTexts(session).at(-1) ?? "";
+		expect(noticeTexts(session).length).toBe(noticeCountAfterRevoke + 1);
+		expect(restoreNotice).toContain("became available");
+		expect(restoreNotice).toContain("xd://ast_edit");
+		expect(restoreNotice).not.toContain("xd://debug");
+		expect(restoreNotice).not.toContain("No longer mounted");
+		// Re-enable is a mount-only change: top-level tools stay ["read"], so the
+		// applied-tool signature is unchanged and the prompt is not rebuilt —
+		// the model learns about the device from the mount notice instead.
+		expect(rebuildCount).toBe(1);
+
+		// Identical re-apply: no new notice, mount set stable.
+		const noticeCountAfterRestore = noticeTexts(session).length;
+		const rebuildAfterRestore = rebuildCount;
+		await session.setActiveToolsByName(["read", "ast_edit"]);
+		expect(session.getMountedXdevToolNames()).toEqual(["ast_edit"]);
+		expect(noticeTexts(session).length).toBe(noticeCountAfterRestore);
+		expect(rebuildCount).toBe(rebuildAfterRestore);
 	});
 });

@@ -59,12 +59,25 @@ describe("read and write route xd:// device URLs", () => {
 				paths: [filePath],
 			});
 
-			// Approval resolves a tier instead of throwing. A mounted tool whose own
-			// approval is a function (unresolvable statically) falls back to exec.
+			// Approval evaluates the mounted tool's function-valued approval against
+			// the parsed device args (filesystem paths → write, not a blind exec).
 			const approval = write!.approval;
 			expect(typeof approval).toBe("function");
 			if (typeof approval === "function") {
-				expect(approval({ path: "xd://ast_edit", content })).toBe("exec");
+				expect(approval({ path: "xd://ast_edit", content })).toBe("write");
+				// Internal-only targets drop to the mounted tool's read tier.
+				expect(
+					approval({
+						path: "xd://ast_edit",
+						content: JSON.stringify({
+							ops: [{ pat: "a", out: "b" }],
+							paths: ["local://plan.md"],
+						}),
+					}),
+				).toBe("read");
+				// Malformed content cannot be evaluated — fail closed to exec.
+				expect(approval({ path: "xd://ast_edit", content: "{not-json" })).toBe("exec");
+				expect(approval({ path: "xd://ast_edit", content: "[1,2]" })).toBe("exec");
 			}
 
 			// Execute dispatches through the xdev registry to the mounted ast_edit,
@@ -86,7 +99,125 @@ describe("read and write route xd:// device URLs", () => {
 		}
 	});
 
-	it("renderCall withholds a partial xd:// URL, then delegates once settled", async () => {
+	it("revokes and re-enables built-in devices through reconcile", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "write-xdev-revoke-"));
+		try {
+			const session = xdevSession(tempDir);
+			const tools = await createTools(session);
+			const write = tools.find(entry => entry.name === "write");
+			const read = tools.find(entry => entry.name === "read");
+			const registry = session.xdevRegistry;
+			if (!write || !read || !registry) throw new Error("expected write/read/xdev");
+
+			const before = registry.list().map(tool => tool.name);
+			expect(before).toContain("ast_edit");
+			expect(before).toContain("debug");
+
+			// Restricted active set: drop every built-in device. Listing, docs, and
+			// dispatch must all fail closed — no name blacklist, just the active set.
+			registry.reconcile([]);
+			expect(registry.size).toBe(0);
+			expect(registry.list()).toEqual([]);
+			const listing = await read.execute("read-xd-empty", { path: "xd://" });
+			const listingText = listing.content.find(entry => entry.type === "text")?.text ?? "";
+			expect(listingText).toContain("0 mounted tool devices");
+			expect(listingText).not.toContain("xd://ast_edit");
+			await expect(read.execute("read-xd-docs-missing", { path: "xd://ast_edit" })).rejects.toThrow(
+				/No such tool device: xd:\/\/ast_edit/,
+			);
+			await expect(
+				write.execute("write-xd-revoked", {
+					path: "xd://ast_edit",
+					content: JSON.stringify({ ops: [], paths: [] }),
+				}),
+			).rejects.toThrow(/No such tool device: xd:\/\/ast_edit/);
+
+			// Re-enable a single built-in: list/docs/dispatch parity restores for it only.
+			// Re-seed from a fresh createTools catalog so we have the real tool instance.
+			const seedSession = xdevSession(tempDir);
+			await createTools(seedSession);
+			const seed = seedSession.xdevRegistry;
+			if (!seed) throw new Error("expected seed registry");
+			const astEdit = seed.get("ast_edit");
+			const debug = seed.get("debug");
+			if (!astEdit || !debug) throw new Error("expected ast_edit and debug");
+			// Point the live session registry at the re-enabled device (simulates
+			// AgentSession applying a restored active set).
+			registry.reconcile([astEdit]);
+			expect(registry.list().map(tool => tool.name)).toEqual(["ast_edit"]);
+			expect(registry.get("debug")).toBeUndefined();
+			const restoredListing = await read.execute("read-xd-restored", { path: "xd://" });
+			const restoredText = restoredListing.content.find(entry => entry.type === "text")?.text ?? "";
+			expect(restoredText).toContain("xd://ast_edit");
+			expect(restoredText).not.toContain("xd://debug");
+			const restoredDocs = await read.execute("read-xd-docs-restored", { path: "xd://ast_edit" });
+			expect(restoredDocs.content.find(entry => entry.type === "text")?.text).toContain("# ast_edit");
+			// debug stays revoked.
+			await expect(read.execute("read-xd-debug-revoked", { path: "xd://debug" })).rejects.toThrow(
+				/No such tool device: xd:\/\/debug/,
+			);
+
+			// Dynamic mounts still work alongside a re-enabled built-in.
+			const custom = Object.create(debug) as typeof debug;
+			Object.defineProperty(custom, "name", { value: "mcp__custom_probe" });
+			Object.defineProperty(custom, "description", { value: "custom probe tool" });
+			Object.defineProperty(custom, "loadMode", { value: "discoverable" });
+			registry.reconcile([astEdit, custom]);
+			expect(registry.list().map(tool => tool.name)).toEqual(["ast_edit", "mcp__custom_probe"]);
+			const mixedListing = await read.execute("read-xd-mixed", { path: "xd://" });
+			const mixedText = mixedListing.content.find(entry => entry.type === "text")?.text ?? "";
+			expect(mixedText).toContain("xd://ast_edit");
+			expect(mixedText).toContain("xd://mcp__custom_probe");
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
+
+	it("evaluates function-valued mounted approvals for read vs exec tiers", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "write-xdev-approval-"));
+		try {
+			const tools = await createTools(xdevSession(tempDir));
+			const write = tools.find(entry => entry.name === "write");
+			expect(write).toBeDefined();
+			const approval = write!.approval;
+			expect(typeof approval).toBe("function");
+			if (typeof approval !== "function") return;
+
+			// debug: readonly action → read; mutating action → exec.
+			expect(approval({ path: "xd://debug", content: JSON.stringify({ action: "sessions" }) })).toBe("read");
+			expect(approval({ path: "xd://debug", content: JSON.stringify({ action: "launch", program: "x" }) })).toBe(
+				"exec",
+			);
+			// ast_edit: internal-only paths → read; filesystem paths → write.
+			expect(
+				approval({
+					path: "xd://ast_edit",
+					content: JSON.stringify({
+						ops: [{ pat: "a", out: "b" }],
+						paths: ["local://plan.md"],
+					}),
+				}),
+			).toBe("read");
+			expect(
+				approval({
+					path: "xd://ast_edit",
+					content: JSON.stringify({
+						ops: [{ pat: "a", out: "b" }],
+						paths: ["/tmp/file.ts"],
+					}),
+				}),
+			).toBe("write");
+			// Unknown device (not mounted / empty name) stays fail-closed at exec.
+			expect(approval({ path: "xd://not_a_real_device", content: "{}" })).toBe("exec");
+			// Empty content still evaluates the function against {} (ast_edit → write).
+			expect(approval({ path: "xd://ast_edit", content: "" })).toBe("write");
+			expect(approval({ path: "xd://ast_edit" })).toBe("write");
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
+
+	it("renderCall withholds partial xd:// prefixes, then renders settled ordinary paths", async () => {
 		await themeModule.initTheme();
 		const uiTheme = (await themeModule.getThemeByName("dark")) ?? (await themeModule.getThemeByName("light"));
 		if (!uiTheme) throw new Error("expected an initialized theme");
@@ -98,13 +229,42 @@ describe("read and write route xd:// device URLs", () => {
 		});
 
 		// Path still streaming (no content field yet): render nothing so the user
-		// never sees a half-typed "xd://ast_" frame.
+		// never sees a half-typed "xd://ast_" frame — including ordinary prefixes
+		// that could still become xd:// ("x", "xd", "xd:", "xd:/").
 		expect(writeToolRenderer.renderCall({ path: "xd://ast_e" }, options, uiTheme)).toBeUndefined();
+		for (const partial of ["x", "xd", "xd:", "xd:/"]) {
+			expect(writeToolRenderer.renderCall({ path: partial }, options, uiTheme)).toBeUndefined();
+		}
+
+		// Settled ordinary paths that only shared the xd:// prefix render as
+		// normal Write frames (not blank, not device-delegated).
+		for (const ordinary of ["x", "xd", "xd:", "xd:/"]) {
+			const ordinaryRendered = writeToolRenderer.renderCall(
+				{ path: ordinary, content: "hello\n" },
+				options,
+				uiTheme,
+			);
+			expect(ordinaryRendered).toBeDefined();
+			const ordinaryText = ordinaryRendered!.render(80).join("\n");
+			expect(ordinaryText).toContain("Write");
+			expect(ordinaryText).toContain(ordinary);
+		}
 
 		// Path settled + content streaming: delegate to the mounted tool's renderer
 		// instead of throwing ReferenceError inside a generic Write frame.
 		const rendered = writeToolRenderer.renderCall({ path: "xd://ast_edit", content }, options, uiTheme);
 		expect(rendered).toBeDefined();
+
+		// Live partial content still withholds until path settles; rebuilt settled
+		// previews keep the ordinary frame.
+		const livePartial = writeToolRenderer.renderCall({ path: "xd" }, { ...options, isPartial: true }, uiTheme);
+		expect(livePartial).toBeUndefined();
+		const rebuilt = writeToolRenderer.renderCall(
+			{ path: "xd", content: "line 1\nline 2\n" },
+			{ expanded: false, isPartial: false },
+			uiTheme,
+		);
+		expect(rebuilt).toBeDefined();
 	});
 
 	it("docsAll inlines small device docs and falls back to a listing past the caps", async () => {
@@ -146,7 +306,8 @@ describe("read and write route xd:// device URLs", () => {
 			const external = Object.create(mounted[0]!) as (typeof mounted)[number];
 			Object.defineProperty(external, "name", { value: "mcp_external_tool" });
 			Object.defineProperty(external, "description", { value: longDescription });
-			registry.reconcile([external]);
+			// Keep the built-in mounted so curated full docs remain in the catalog.
+			registry.reconcile([mounted[0]!, external]);
 
 			const docs = registry.docsAll();
 			// External device: schema section present, description cut at the cap.

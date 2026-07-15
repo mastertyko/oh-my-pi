@@ -1952,7 +1952,7 @@ export class AgentSession {
 	#rpcHostToolNames = new Set<string>();
 	/** Session-owned `xd://` device registry (built-ins + dynamic mounts); `undefined` when the transport is off. */
 	#xdevRegistry: XdevRegistry | undefined;
-	/** Names of discoverable tools currently mounted under `xd://` (dynamic mounts only, not built-in devices). */
+	/** Names of discoverable tools currently mounted under `xd://` (built-ins + dynamic). */
 	#mountedXdevToolNames = new Set<string>();
 
 	// TTSR manager for time-traveling stream rules
@@ -6514,7 +6514,7 @@ export class AgentSession {
 		return [...this.getActiveToolNames(), ...this.#mountedXdevToolNames];
 	}
 
-	/** Names of discoverable tools currently mounted under `xd://` (dynamic mounts). */
+	/** Names of discoverable tools currently mounted under `xd://` (built-ins + dynamic). */
 	getMountedXdevToolNames(): string[] {
 		return [...this.#mountedXdevToolNames];
 	}
@@ -6755,9 +6755,10 @@ export class AgentSession {
 				validToolNames.push(name);
 			}
 		}
-		// Reconcile the dynamic `xd://` mounts: newly-active discoverable tools are
-		// mounted, deactivated ones dropped (built-in devices are preserved). A
-		// removed or disconnected tool must not stay callable through a stale device.
+		// Reconcile the entire `xd://` mount set from the enabled tool names:
+		// newly-active discoverable tools (built-in or dynamic) are mounted,
+		// deactivated ones dropped — including built-ins so plan/restricted
+		// active sets cannot call omitted devices through write xd://.
 		const previousMounted = this.#mountedXdevToolNames;
 		this.#mountedXdevToolNames = new Set(mountedTools.map(tool => tool.name));
 		this.#xdevRegistry?.reconcile(mountedTools);

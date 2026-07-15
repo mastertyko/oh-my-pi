@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed restricted active-tool sets leaving disabled built-in `xd://` devices discoverable and dispatchable. `XdevRegistry.reconcile` now replaces the full active mount set (including built-ins), and `createTools`/SDK re-register the device catalog into the tool registry so plan/restricted selection can revoke and re-enable devices without a name blacklist.
+- Fixed outer `write` approval for `xd://` device dispatches ignoring function-valued mounted-tool approvals and always falling back to `exec`. The write gate now parses device JSON once and evaluates the mounted tool's approval against those args (malformed payloads stay fail-closed at `exec`).
+- Fixed settled ordinary write paths that only shared an `xd://` prefix (`x`, `xd`, `xd:`, `xd:/`) rendering blank while streaming. Partial prefixes still withhold until settled; settled non-device paths render as normal writes.
+
 ## [17.0.0] - 2026-07-15
 
 ### Breaking Changes

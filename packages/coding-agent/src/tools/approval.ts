@@ -69,7 +69,11 @@ function normalizeDecision(value: unknown): Omit<ResolvedApproval, "policy"> {
 	return { tier: "exec", override: false };
 }
 
-function getToolDecision(tool: ApprovalSubject, args: unknown): Omit<ResolvedApproval, "policy"> {
+/**
+ * Evaluate a tool's static or function-valued `approval` against `args`.
+ * Defaults to tier `"exec"` when omitted or unrecognized — fail-closed.
+ */
+export function getToolApprovalDecision(tool: ApprovalSubject, args: unknown): Omit<ResolvedApproval, "policy"> {
 	const approval = tool.approval;
 	const decision: ToolApprovalDecision | undefined = typeof approval === "function" ? approval(args) : approval;
 	return normalizeDecision(decision);
@@ -96,7 +100,7 @@ export function resolveApproval(
 	mode: ApprovalMode,
 	userConfig: Record<string, unknown> = {},
 ): ResolvedApproval {
-	const decision = getToolDecision(tool, args);
+	const decision = getToolApprovalDecision(tool, args);
 	const userPolicy = Object.hasOwn(userConfig, tool.name) ? normalizePolicy(userConfig[tool.name]) : undefined;
 
 	if (mode === "yolo") {
