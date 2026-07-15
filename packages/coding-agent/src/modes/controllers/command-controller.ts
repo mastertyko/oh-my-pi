@@ -14,7 +14,7 @@ import { Loader, Markdown, padding, Spacer, Text, visibleWidth } from "@oh-my-pi
 import { formatDuration, Snowflake, sanitizeText } from "@oh-my-pi/pi-utils";
 import { shouldEnableAppendOnlyContext } from "../../config/append-only-context-mode";
 import { type LoadedCustomShare, loadCustomShare } from "../../export/custom-share";
-import { shareSession } from "../../export/share";
+import { resolveShareObfuscator, shareSession } from "../../export/share";
 import type { CompactOptions } from "../../extensibility/extensions/types";
 import {
 	diffMentalModelContent,
@@ -226,7 +226,12 @@ export class CommandController {
 				serverUrl: this.ctx.settings.get("share.serverUrl"),
 				store: this.ctx.settings.get("share.store"),
 				state: this.ctx.session.state,
-				obfuscator: this.ctx.settings.get("share.redactSecrets") ? this.ctx.session.obfuscator : undefined,
+				obfuscator: await resolveShareObfuscator({
+					redactSecrets: this.ctx.settings.get("share.redactSecrets"),
+					existing: this.ctx.session.obfuscator,
+					cwd: this.ctx.session.sessionManager.getCwd(),
+					agentDir: this.ctx.settings.getAgentDir(),
+				}),
 			});
 			if (loader.signal.aborted) return;
 			restoreEditor();

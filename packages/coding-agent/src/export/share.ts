@@ -24,7 +24,8 @@ import type { AssistantMessage, ImageContent, TextContent } from "@oh-my-pi/pi-a
 import { $which, logger } from "@oh-my-pi/pi-utils";
 import { DEFAULT_SHARE_URL } from "@oh-my-pi/pi-wire";
 import { $ } from "bun";
-import { obfuscateToolArguments, type SecretObfuscator } from "../secrets/obfuscator";
+import { collectEnvSecrets, loadSecrets, SecretObfuscator } from "../secrets";
+import { obfuscateToolArguments } from "../secrets/obfuscator";
 import type { SessionEntry, SessionHeader } from "../session/session-entries";
 import type { SessionManager } from "../session/session-manager";
 import type { OutputMeta } from "../tools/output-meta";
@@ -73,6 +74,9 @@ export interface ShareSessionOptions {
 	 * `redactedThinking`, `compaction.preserveData`) and untyped extension payloads
 	 * (`details`/`data`/`outputSchema`) are dropped rather than walked. Pass
 	 * undefined to skip redaction entirely.
+	 *
+	 * Prefer {@link resolveShareObfuscator} when `share.redactSecrets` is on: it
+	 * loads the secrets inventory even if runtime `secrets.enabled` is off.
 	 */
 	obfuscator?: SecretObfuscator;
 }
@@ -86,6 +90,34 @@ export interface ShareSessionResult {
 	/** True when content was trimmed to fit the upload budget. */
 	truncated: boolean;
 	sealedBytes: number;
+}
+
+/**
+ * Build the obfuscator used for share redaction.
+ *
+ * Independent of `secrets.enabled`: a share blob leaves the machine, so when
+ * `share.redactSecrets` is on we load the supported inventory (env vars that
+ * look like secrets + project/global `secrets.yml`) even if runtime secret
+ * masking is disabled. Reuses `existing` when it already holds secrets so we
+ * do not reload unnecessarily.
+ */
+export async function resolveShareObfuscator(options: {
+	redactSecrets: boolean;
+	/** Existing session obfuscator; reused when it already holds secrets. */
+	existing?: SecretObfuscator;
+	cwd: string;
+	agentDir: string;
+}): Promise<SecretObfuscator | undefined> {
+	if (!options.redactSecrets) return undefined;
+	if (options.existing?.hasSecrets()) return options.existing;
+
+	const fileEntries = await loadSecrets(options.cwd, options.agentDir);
+	const envEntries = collectEnvSecrets();
+	const allEntries = [...envEntries, ...fileEntries];
+	if (allEntries.length === 0) return undefined;
+
+	const obfuscator = new SecretObfuscator(allEntries);
+	return obfuscator.hasSecrets() ? obfuscator : undefined;
 }
 
 /** Build the snapshot that gets sealed and uploaded, redacted when an obfuscator is provided. */
@@ -144,6 +176,7 @@ function redactShareEntry(o: SecretObfuscator, entry: SessionEntry): SessionEntr
 				...entry,
 				summary: o.obfuscate(entry.summary),
 				shortSummary: entry.shortSummary === undefined ? undefined : o.obfuscate(entry.shortSummary),
+				warning: entry.warning === undefined ? undefined : o.obfuscate(entry.warning),
 				details: undefined,
 				preserveData: undefined,
 			};
@@ -164,6 +197,12 @@ function redactShareEntry(o: SecretObfuscator, entry: SessionEntry): SessionEntr
 			};
 		case "label":
 			return { ...entry, label: entry.label === undefined ? undefined : o.obfuscate(entry.label) };
+		case "title_change":
+			return {
+				...entry,
+				title: o.obfuscate(entry.title),
+				previousTitle: entry.previousTitle === undefined ? undefined : o.obfuscate(entry.previousTitle),
+			};
 		default:
 			return entry;
 	}

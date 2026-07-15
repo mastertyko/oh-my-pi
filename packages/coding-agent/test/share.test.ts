@@ -1,8 +1,12 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { SessionData } from "../src/export/html";
 import {
 	buildShareSnapshot,
 	normalizeShareServerUrl,
+	resolveShareObfuscator,
 	SERVER_MAX_SEALED_BYTES,
 	sealToFit,
 	shareSession,
@@ -248,6 +252,130 @@ describe("buildShareSnapshot", () => {
 		expect(flat).not.toContain(replaySentinel);
 		// Source entries keep the real values; redaction is share-only.
 		expect(JSON.stringify(entries)).toContain(secret);
+	});
+
+	test("redacts title_change titles and compaction.warning while preserving source entries", () => {
+		const secret = "titlewarn-secret-ABCDEF";
+		const ts = "2026-06-12T00:00:00.000Z";
+		const entries: SessionEntry[] = [
+			{
+				type: "title_change",
+				id: "t1",
+				parentId: null,
+				timestamp: ts,
+				title: `Session ${secret}`,
+				previousTitle: `Old ${secret}`,
+				source: "user",
+			} as SessionEntry,
+			{
+				type: "compaction",
+				id: "c1",
+				parentId: "t1",
+				timestamp: ts,
+				summary: `compacted ${secret}`,
+				tokensBefore: 1000,
+				warning: `progress guard: ${secret} still too large`,
+			} as SessionEntry,
+		];
+		const sm = {
+			getHeader: () => sessionData([], "x").header,
+			getEntries: () => entries,
+			getLeafId: () => "c1",
+		} as unknown as SessionManager;
+		const obfuscator = new SecretObfuscator([{ type: "plain", content: secret }]);
+		const placeholder = obfuscator.obfuscate(secret);
+
+		const snapshot = buildShareSnapshot(sm, { obfuscator });
+		const flat = JSON.stringify(snapshot);
+
+		expect(flat).not.toContain(secret);
+		// Deterministic placeholders replace freeform secret occurrences.
+		expect(flat).toContain(placeholder);
+		expect(flat).toContain("Session ");
+		expect(flat).toContain("Old ");
+		expect(flat).toContain("progress guard:");
+		// Source entries keep the real values; redaction is share-only.
+		expect(JSON.stringify(entries)).toContain(secret);
+		expect(JSON.stringify(entries)).toContain(`Session ${secret}`);
+		expect(JSON.stringify(entries)).toContain(`Old ${secret}`);
+		expect(JSON.stringify(entries)).toContain(`progress guard: ${secret}`);
+	});
+});
+
+describe("resolveShareObfuscator", () => {
+	const tempDirs: string[] = [];
+
+	afterEach(() => {
+		for (const dir of tempDirs.splice(0)) {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("loads secrets inventory when share redaction is on even without a runtime obfuscator", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "share-redact-"));
+		tempDirs.push(root);
+		const cwd = path.join(root, "project");
+		const agentDir = path.join(root, "agent");
+		fs.mkdirSync(path.join(cwd, ".omp"), { recursive: true });
+		fs.mkdirSync(agentDir, { recursive: true });
+
+		const secret = "share-redact-secret-ABCDEF";
+		fs.writeFileSync(path.join(cwd, ".omp", "secrets.yml"), `- type: plain\n  content: ${secret}\n`);
+
+		const obfuscator = await resolveShareObfuscator({
+			redactSecrets: true,
+			existing: undefined,
+			cwd,
+			agentDir,
+		});
+		expect(obfuscator?.hasSecrets()).toBe(true);
+
+		const entries = [messageEntry("e1", null, `token ${secret} ordinary text`)];
+		const sm = {
+			getHeader: () => sessionData([], "x").header,
+			getEntries: () => entries,
+			getLeafId: () => "e1",
+		} as unknown as SessionManager;
+
+		const snapshot = buildShareSnapshot(sm, { obfuscator });
+		const flat = JSON.stringify(snapshot);
+		expect(flat).not.toContain(secret);
+		expect(flat).toContain("ordinary text");
+		// Source remains untouched; redaction is share-only.
+		expect(JSON.stringify(entries)).toContain(secret);
+	});
+
+	test("returns undefined when share redaction is disabled", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "share-redact-off-"));
+		tempDirs.push(root);
+		const cwd = path.join(root, "project");
+		const agentDir = path.join(root, "agent");
+		fs.mkdirSync(path.join(cwd, ".omp"), { recursive: true });
+		fs.mkdirSync(agentDir, { recursive: true });
+		fs.writeFileSync(path.join(cwd, ".omp", "secrets.yml"), "- type: plain\n  content: ignored-secret-ABCDEF\n");
+
+		const obfuscator = await resolveShareObfuscator({
+			redactSecrets: false,
+			existing: undefined,
+			cwd,
+			agentDir,
+		});
+		expect(obfuscator).toBeUndefined();
+	});
+
+	test("reuses an existing runtime obfuscator that already has secrets", async () => {
+		const secret = "runtime-share-secret-XYZ123";
+		const existing = new SecretObfuscator([{ type: "plain", content: secret }]);
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "share-redact-reuse-"));
+		tempDirs.push(root);
+
+		const obfuscator = await resolveShareObfuscator({
+			redactSecrets: true,
+			existing,
+			cwd: root,
+			agentDir: root,
+		});
+		expect(obfuscator).toBe(existing);
 	});
 });
 

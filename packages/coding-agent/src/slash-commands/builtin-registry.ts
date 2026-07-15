@@ -16,7 +16,7 @@ import {
 	resolveActiveProjectRegistryPath,
 	resolveOrDefaultProjectRegistryPath,
 } from "../discovery/helpers.js";
-import { shareSession } from "../export/share";
+import { resolveShareObfuscator, shareSession } from "../export/share";
 import { PluginManager } from "../extensibility/plugins";
 import {
 	getInstalledPluginsRegistryPath,
@@ -670,7 +670,12 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 					serverUrl: runtime.settings.get("share.serverUrl"),
 					store: runtime.settings.get("share.store"),
 					state: runtime.session.state,
-					obfuscator: runtime.settings.get("share.redactSecrets") ? runtime.session.obfuscator : undefined,
+					obfuscator: await resolveShareObfuscator({
+						redactSecrets: runtime.settings.get("share.redactSecrets"),
+						existing: runtime.session.obfuscator,
+						cwd: runtime.cwd,
+						agentDir: runtime.settings.getAgentDir(),
+					}),
 				});
 				const lines = [`Share URL: ${result.url}`];
 				if (result.gistUrl) lines.push(`Gist: ${result.gistUrl}`);

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `/share` secret redaction so `share.redactSecrets` (default on) loads the supported secrets inventory and redacts the shared snapshot even when runtime `secrets.enabled` is off and no session obfuscator was constructed.
+
 ## [17.0.0] - 2026-07-15
 
 ### Breaking Changes
