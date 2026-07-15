@@ -145,6 +145,7 @@ function isInsideShellQuote(command: string, index: number): boolean {
 	type ShellQuote = "'" | '"' | undefined;
 	interface CommandSubstitution {
 		outerQuote: ShellQuote;
+		/** Remaining open parentheses for `$()` nesting; `0` means a backtick substitution. */
 		depth: number;
 	}
 
@@ -153,6 +154,7 @@ function isInsideShellQuote(command: string, index: number): boolean {
 	for (let i = 0; i < index; i++) {
 		const char = command[i];
 		if (char === "\\" && quote !== "'") {
+			// Escaped backticks/backslashes stay literal outside single quotes.
 			i++;
 			continue;
 		}
@@ -162,6 +164,30 @@ function isInsideShellQuote(command: string, index: number): boolean {
 		}
 		if (char === '"' && quote !== "'") {
 			quote = quote === '"' ? undefined : '"';
+			continue;
+		}
+		// Backtick substitutions expand even inside double quotes (like `$()`).
+		if (char === "`" && quote !== "'") {
+			let openBacktickIndex = -1;
+			for (let s = substitutions.length - 1; s >= 0; s--) {
+				if (substitutions[s].depth === 0) {
+					openBacktickIndex = s;
+					break;
+				}
+			}
+			if (openBacktickIndex >= 0) {
+				// Close through the innermost open backtick (and any nested `$()` inside it).
+				while (substitutions.length > openBacktickIndex) {
+					const closed = substitutions.pop();
+					if (closed?.depth === 0) {
+						quote = closed.outerQuote;
+						break;
+					}
+				}
+			} else {
+				substitutions.push({ outerQuote: quote, depth: 0 });
+				quote = undefined;
+			}
 			continue;
 		}
 		if (char === "$" && command[i + 1] === "(" && quote !== "'") {
@@ -174,6 +200,8 @@ function isInsideShellQuote(command: string, index: number): boolean {
 
 		const substitution = substitutions.at(-1);
 		if (!substitution) continue;
+		// Parentheses only nest inside `$()` substitutions, never backticks.
+		if (substitution.depth === 0) continue;
 		if (char === "(") {
 			substitution.depth++;
 		} else if (char === ")") {

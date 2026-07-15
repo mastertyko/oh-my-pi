@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Bash internal-URL expansion so unquoted `skill://` / `memory://` / similar tokens inside backtick substitutions (`echo "\`cat skill://…\`"`) expand the same way as inside `$()`, without rewriting ordinary double-quoted protocol text.
+
 ## [17.0.0] - 2026-07-15
 
 ### Breaking Changes

@@ -216,6 +216,91 @@ describe("expandInternalUrls", () => {
 		);
 	});
 
+	it("expands an unquoted URL inside a double-quoted backtick substitution", async () => {
+		const skills = [createSkill("valid-skill", "/tmp/skills/valid-skill")];
+		const command = 'echo "`cat skill://valid-skill/SKILL.md`"';
+		const expectedPath = path.join(skills[0].baseDir, "SKILL.md");
+
+		await expect(expandInternalUrls(command, { skills })).resolves.toBe(
+			`echo "\`cat ${shellEscape(expectedPath)}\`"`,
+		);
+	});
+
+	it("expands a top-level backtick substitution with an unquoted URL", async () => {
+		const skills = [createSkill("valid-skill", "/tmp/skills/valid-skill")];
+		const command = "echo `cat skill://valid-skill/SKILL.md`";
+		const expectedPath = path.join(skills[0].baseDir, "SKILL.md");
+
+		await expect(expandInternalUrls(command, { skills })).resolves.toBe(`echo \`cat ${shellEscape(expectedPath)}\``);
+	});
+
+	it("expands multiple backtick substitutions in one double-quoted string", async () => {
+		const skills = [createSkill("skill-a", "/tmp/skills/skill-a"), createSkill("skill-b", "/tmp/skills/skill-b")];
+		const command = 'echo "`cat skill://skill-a/a.md` and `cat skill://skill-b/b.md`"';
+		const pathA = path.join(skills[0].baseDir, "a.md");
+		const pathB = path.join(skills[1].baseDir, "b.md");
+
+		await expect(expandInternalUrls(command, { skills })).resolves.toBe(
+			`echo "\`cat ${shellEscape(pathA)}\` and \`cat ${shellEscape(pathB)}\`"`,
+		);
+	});
+
+	it("expands a URL inside nested $() within a backtick substitution", async () => {
+		const skills = [createSkill("valid-skill", "/tmp/skills/valid-skill")];
+		const command = 'echo "`echo $(cat skill://valid-skill/SKILL.md)`"';
+		const expectedPath = path.join(skills[0].baseDir, "SKILL.md");
+
+		await expect(expandInternalUrls(command, { skills })).resolves.toBe(
+			`echo "\`echo $(cat ${shellEscape(expectedPath)})\`"`,
+		);
+	});
+
+	it("expands a URL inside nested backticks within $()", async () => {
+		const skills = [createSkill("valid-skill", "/tmp/skills/valid-skill")];
+		const command = 'echo "$(echo `cat skill://valid-skill/SKILL.md`)"';
+		const expectedPath = path.join(skills[0].baseDir, "SKILL.md");
+
+		await expect(expandInternalUrls(command, { skills })).resolves.toBe(
+			`echo "$(echo \`cat ${shellEscape(expectedPath)}\`)"`,
+		);
+	});
+
+	it("does not expand URLs inside single-quoted text with backticks", async () => {
+		const skills = [createSkill("valid-skill", "/tmp/skills/valid-skill")];
+		const command = "echo '`cat skill://valid-skill/SKILL.md`'";
+
+		await expect(expandInternalUrls(command, { skills })).resolves.toBe(command);
+	});
+
+	it("treats escaped backticks as literal and does not open a substitution", async () => {
+		const skills = [createSkill("valid-skill", "/tmp/skills/valid-skill")];
+		// Outside quotes the backslash escapes the backtick, so the URL is not in a subshell.
+		// Inside double quotes an escaped backtick is also literal, so the URL stays embedded.
+		const command = 'echo "\\`skill://valid-skill/SKILL.md\\`"';
+
+		await expect(expandInternalUrls(command, { skills })).resolves.toBe(command);
+	});
+
+	it("leaves an unmatched open backtick substitution without expanding outer quote text", async () => {
+		const skills = [createSkill("valid-skill", "/tmp/skills/valid-skill")];
+		// Unmatched opener puts us "inside" the substitution (unquoted), so the URL expands.
+		// The trailing double-quoted text after a closed sub is still quoted.
+		const openOnly = 'echo "`cat skill://valid-skill/SKILL.md';
+		const expectedPath = path.join(skills[0].baseDir, "SKILL.md");
+		await expect(expandInternalUrls(openOnly, { skills })).resolves.toBe(`echo "\`cat ${shellEscape(expectedPath)}`);
+
+		// After a closed backtick pair, further text remains double-quoted.
+		const closedThenQuoted = 'echo "`true` skill://valid-skill/SKILL.md"';
+		await expect(expandInternalUrls(closedThenQuoted, { skills })).resolves.toBe(closedThenQuoted);
+	});
+
+	it("does not expand ordinary protocol text that is merely double-quoted", async () => {
+		const skills = [createSkill("valid-skill", "/tmp/skills/valid-skill")];
+		const command = 'printf "%s\\n" "see skill://valid-skill/SKILL.md in the docs"';
+
+		await expect(expandInternalUrls(command, { skills })).resolves.toBe(command);
+	});
+
 	it("leaves literal internal URLs embedded in quoted text unchanged", async () => {
 		const router = createInternalRouter({
 			"memory://root/summary.md": { sourcePath: "/tmp/memories/summary.md" },
