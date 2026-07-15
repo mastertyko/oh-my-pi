@@ -55,6 +55,10 @@ export interface BeamConfig {
 	localLlmEnabled: boolean;
 	maxEpisodeChars: number;
 	proactiveLinking?: boolean;
+	/** Per-instance polyphonic recall gate (env still wins when set). */
+	polyphonicRecall?: boolean;
+	/** Per-instance enhanced-recall/query-cache gate (env still wins when set). */
+	enhancedRecall?: boolean;
 }
 
 export interface BeamMemoryOptions {
@@ -65,6 +69,8 @@ export interface BeamMemoryOptions {
 	channelId?: string | null;
 	useCloud?: boolean;
 	proactiveLinking?: boolean;
+	polyphonicRecall?: boolean;
+	enhancedRecall?: boolean;
 	eventEmitter?: (event: BeamEvent) => void;
 	pluginManager?: BeamPluginManager | null;
 	annotations?: AnnotationStoreLike | null;

@@ -198,16 +198,19 @@ export interface MnemopiSessionStateOptions {
 
 export class MnemopiSessionState {
 	sessionId: string;
-	readonly config: MnemopiBackendConfig;
+	/** Mutable so runtime policy (autoRecall/autoRetain/…) can hot-patch without reopening banks. */
+	config: MnemopiBackendConfig;
 	readonly session: AgentSession;
 	readonly memory: Mnemopi;
 	readonly globalMemory?: Mnemopi;
 	readonly aliasOf?: MnemopiSessionState;
-	private readonly scoped: MnemopiScopedResources;
+	#scoped: MnemopiScopedResources;
 	lastRetainedTurn: number;
 	hasRecalledForFirstTurn: boolean;
 	lastRecallSnippet?: string;
 	unsubscribe?: () => void;
+	/** Releases the mnemopi runtime-policy settings subscription (primary states only). */
+	unsubscribeRuntime?: () => void;
 
 	constructor(options: MnemopiSessionStateOptions) {
 		this.sessionId = options.sessionId;
@@ -216,9 +219,9 @@ export class MnemopiSessionState {
 		this.aliasOf = options.aliasOf;
 		this.lastRetainedTurn = options.lastRetainedTurn ?? 0;
 		this.hasRecalledForFirstTurn = options.hasRecalledForFirstTurn ?? false;
-		this.scoped = options.aliasOf?.scoped ?? createScopedResources(options.config);
-		this.memory = this.scoped.retain.memory;
-		this.globalMemory = this.scoped.global?.memory;
+		this.#scoped = options.aliasOf ? options.aliasOf.#scoped : createScopedResources(options.config);
+		this.memory = this.#scoped.retain.memory;
+		this.globalMemory = this.#scoped.global?.memory;
 	}
 
 	setSessionId(sessionId: string): void {
@@ -231,20 +234,67 @@ export class MnemopiSessionState {
 		this.lastRecallSnippet = undefined;
 	}
 
+	/**
+	 * Hot-patch live runtime knobs from the canonical settings loader without
+	 * reopening SQLite banks. Used when the operator toggles auto-recall,
+	 * auto-retain, polyphonic/enhanced recall, or related limits mid-session
+	 * so selector changes and session behaviour share one source of truth.
+	 *
+	 * Bank/scope changes still require a full backend restart (different DB
+	 * handles); those keys are intentionally not accepted here.
+	 */
+	applyRuntimePolicy(policy: Partial<MnemopiBackendConfig>): void {
+		if (this.aliasOf) {
+			this.aliasOf.applyRuntimePolicy(policy);
+			// Keep the alias's public config view in lockstep for diagnostics.
+			this.config = this.aliasOf.config;
+			return;
+		}
+		const next: MnemopiBackendConfig = { ...this.config };
+		if (policy.autoRecall !== undefined) next.autoRecall = policy.autoRecall;
+		if (policy.autoRetain !== undefined) next.autoRetain = policy.autoRetain;
+		if (policy.polyphonicRecall !== undefined) next.polyphonicRecall = policy.polyphonicRecall;
+		if (policy.enhancedRecall !== undefined) next.enhancedRecall = policy.enhancedRecall;
+		if (policy.proactiveLinking !== undefined) next.proactiveLinking = policy.proactiveLinking;
+		if (policy.retainEveryNTurns !== undefined) {
+			next.retainEveryNTurns = Math.max(1, Math.floor(policy.retainEveryNTurns));
+		}
+		if (policy.recallLimit !== undefined) next.recallLimit = Math.max(1, Math.floor(policy.recallLimit));
+		if (policy.recallContextTurns !== undefined) {
+			next.recallContextTurns = Math.max(1, Math.floor(policy.recallContextTurns));
+		}
+		if (policy.recallMaxQueryChars !== undefined) {
+			next.recallMaxQueryChars = Math.max(256, Math.floor(policy.recallMaxQueryChars));
+		}
+		if (policy.injectionTokenLimit !== undefined) {
+			next.injectionTokenLimit = Math.max(256, Math.floor(policy.injectionTokenLimit));
+		}
+		if (policy.debug !== undefined) next.debug = policy.debug;
+		this.config = next;
+		// Per-instance feature gates on every owned Mnemopi handle — never the
+		// process-global configureRecallFeatures slot (concurrent sessions).
+		for (const memory of this.#scoped.owned) {
+			memory.setRecallFeatures({
+				polyphonicRecall: next.polyphonicRecall,
+				enhancedRecall: next.enhancedRecall,
+				proactiveLinking: next.proactiveLinking,
+			});
+		}
+	}
+
 	getScopedRecallTargets(): readonly MnemopiScopedMemory[] {
-		return this.scoped.recall;
+		return this.#scoped.recall;
 	}
 
 	getScopedRetainTarget(): MnemopiScopedMemory {
-		return this.scoped.retain;
+		return this.#scoped.retain;
 	}
 
 	/**
 	 * Read counterpart to {@link editScopedMemory}: fetch a memory row by id
 	 * from any bank this session recalls from (retain, recall, global). First
-	 * hit wins in the same order {@link editScopedMemory} would touch, so the
-	 * shape matches what an `update`/`forget`/`invalidate` on the same id will
-	 * see. Returns `null` when the id is not found anywhere in scope.
+	 * hit wins. Reads may surface shared-bank rows under per-project-tagged;
+	 * mutations never do (see {@link editScopedMemory}).
 	 *
 	 * Backs the coding-agent `memory://<id>` URL so agents can inspect the
 	 * FULL content of a recall preview (recall clips content — see
@@ -254,9 +304,9 @@ export class MnemopiSessionState {
 	 */
 	getScopedMemory(id: string): MnemopiScopedMemoryHit | null {
 		const targets = dedupeScopedTargets([
-			this.scoped.retain,
-			...this.scoped.recall,
-			...(this.scoped.global ? [this.scoped.global] : []),
+			this.#scoped.retain,
+			...this.#scoped.recall,
+			...(this.#scoped.global ? [this.#scoped.global] : []),
 		]);
 		for (const target of targets) {
 			const raw = target.memory.get(id) as MnemopiStoredMemoryRow | null;
@@ -283,52 +333,65 @@ export class MnemopiSessionState {
 		return null;
 	}
 
+	/**
+	 * Mutate a memory by id.
+	 *
+	 * Writable targets are the retain bank only. Under `per-project-tagged`
+	 * the shared/global bank is recall-visible but never mutated by
+	 * update/forget/invalidate — a shared-bank hit returns `not_editable`.
+	 * `global` scoping retains to the shared bank, so that bank remains writable.
+	 */
 	editScopedMemory(
 		op: MnemopiMemoryEditOperation,
 		id: string,
 		options: MnemopiMemoryEditOptions = {},
 	): MnemopiMemoryEditResult {
-		const targets = dedupeScopedTargets([
-			this.scoped.retain,
-			...this.scoped.recall,
-			...(this.scoped.global ? [this.scoped.global] : []),
-		]);
-		let ineligible: MnemopiMemoryEditResult | undefined;
-		for (const target of targets) {
-			const row = target.memory.get(id) as MnemopiStoredMemoryRow | null;
-			if (!row) continue;
+		const writable = this.#scoped.retain;
+		const row = writable.memory.get(id) as MnemopiStoredMemoryRow | null;
+		if (row) {
 			const store: MnemopiMemoryStore =
 				row.memory_store === "episodic" || row.memory_store === "fact" ? row.memory_store : "working";
-			const resultContext: Pick<MnemopiMemoryEditResult, "bank" | "store"> = { bank: target.bank, store };
+			const resultContext: Pick<MnemopiMemoryEditResult, "bank" | "store"> = {
+				bank: writable.bank,
+				store,
+			};
 			if (store === "fact") {
-				// Facts are read-only: no memory_edit op mutates the facts
-				// table, so report that precisely instead of `not_found`
-				// (the id DID resolve — issue #4725).
-				ineligible ??= { status: "not_editable", ...resultContext };
-				continue;
+				return { status: "not_editable", ...resultContext };
 			}
 			if ((op === "update" || op === "forget") && store !== "working") {
-				ineligible ??= { status: "not_found", ...resultContext };
-				continue;
+				return { status: "not_found", ...resultContext };
 			}
 			if (op === "update") {
-				if (target.memory.update(id, options.content ?? null, options.importance ?? null)) {
+				if (writable.memory.update(id, options.content ?? null, options.importance ?? null)) {
 					return { status: "updated", ...resultContext };
 				}
-				ineligible ??= { status: "not_found", ...resultContext };
-				continue;
+				return { status: "not_found", ...resultContext };
 			}
 			if (op === "forget") {
-				if (target.memory.forget(id)) return { status: "deleted", ...resultContext };
-				ineligible ??= { status: "not_found", ...resultContext };
-				continue;
+				if (writable.memory.forget(id)) return { status: "deleted", ...resultContext };
+				return { status: "not_found", ...resultContext };
 			}
-			if (target.memory.beam.invalidate(id, options.replacementId ?? null)) {
+			if (writable.memory.beam.invalidate(id, options.replacementId ?? null)) {
 				return { status: "invalidated", ...resultContext };
 			}
-			ineligible ??= { status: "not_found", ...resultContext };
+			return { status: "not_found", ...resultContext };
 		}
-		return ineligible ?? { status: "not_found" };
+
+		// Id not in the retain bank. If it lives in a recall-only shared bank
+		// (per-project-tagged), refuse mutation instead of pretending not_found
+		// when the agent just recalled it.
+		const readOnlyTargets = dedupeScopedTargets([
+			...this.#scoped.recall,
+			...(this.#scoped.global ? [this.#scoped.global] : []),
+		]).filter(target => target.bank !== writable.bank);
+		for (const target of readOnlyTargets) {
+			const remote = target.memory.get(id) as MnemopiStoredMemoryRow | null;
+			if (!remote) continue;
+			const store: MnemopiMemoryStore =
+				remote.memory_store === "episodic" || remote.memory_store === "fact" ? remote.memory_store : "working";
+			return { status: "not_editable", bank: target.bank, store };
+		}
+		return { status: "not_found" };
 	}
 
 	formatScopedRecallWithIds(results: readonly RecallResult[]): string {
@@ -350,12 +413,12 @@ export class MnemopiSessionState {
 		const byContent = new Map<string, number>();
 		const sharedFallbackQuery = deriveSharedRecallFallbackQuery(
 			query,
-			this.scoped.retain.bank,
-			this.scoped.global?.bank,
+			this.#scoped.retain.bank,
+			this.#scoped.global?.bank,
 		);
-		for (const target of this.scoped.recall) {
+		for (const target of this.#scoped.recall) {
 			const queries =
-				target.bank === this.scoped.global?.bank && sharedFallbackQuery ? [query, sharedFallbackQuery] : [query];
+				target.bank === this.#scoped.global?.bank && sharedFallbackQuery ? [query, sharedFallbackQuery] : [query];
 			try {
 				for (const recallQuery of queries) {
 					const results = await target.memory.recallEnhanced(recallQuery, this.config.recallLimit, {
@@ -398,10 +461,10 @@ export class MnemopiSessionState {
 
 	rememberInScope(memory: MnemopiRememberInput, options: MnemopiRememberOptions = {}): string | undefined {
 		try {
-			return this.scoped.retain.memory.remember(memory, options);
+			return this.#scoped.retain.memory.remember(memory, options);
 		} catch (error) {
 			logger.warn("Mnemopi: retain failed", {
-				bank: this.scoped.retain.bank,
+				bank: this.#scoped.retain.bank,
 				error: String(error),
 			});
 			return undefined;
@@ -533,7 +596,7 @@ export class MnemopiSessionState {
 	 */
 	async consolidate(): Promise<void> {
 		await this.forceRetainCurrentSession();
-		for (const memory of this.scoped.owned) {
+		for (const memory of this.#scoped.owned) {
 			await memory.flushExtractions();
 			memory.sleepAllSessions(false);
 		}
@@ -561,9 +624,11 @@ export class MnemopiSessionState {
 	async dispose(options: { consolidate?: boolean; timeoutMs?: number } = {}): Promise<void> {
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
+		this.unsubscribeRuntime?.();
+		this.unsubscribeRuntime = undefined;
 		if (this.aliasOf) return;
 		const closeOwned = (): void => {
-			for (const memory of this.scoped.owned) memory.close();
+			for (const memory of this.#scoped.owned) memory.close();
 		};
 		if (options.consolidate === false) {
 			closeOwned();
@@ -600,14 +665,11 @@ export class MnemopiSessionState {
 
 // `per-project-tagged` is implemented by opening both the project bank and the
 // shared bank, then merging recall results while keeping writes project-local.
+// Plain `per-project` NEVER opens the shared/global bank — clear/forget/stats
+// must stay project-bounded unless the user explicitly selected a shared mode.
+// Recall feature flags are per Mnemopi instance (constructor + setRecallFeatures),
+// never process-global configureRecallFeatures, so concurrent sessions stay independent.
 function createScopedResources(config: MnemopiBackendConfig): MnemopiScopedResources {
-	// Env vars (MNEMOPI_POLYPHONIC_RECALL / MNEMOPI_ENHANCED_RECALL) still override
-	// these config-driven defaults inside the core gates. Proactive linking is
-	// per-memory instance below so concurrent sessions cannot clobber each other.
-	requireMnemopi().configureRecallFeatures({
-		polyphonicRecall: config.polyphonicRecall,
-		enhancedRecall: config.enhancedRecall,
-	});
 	const banks = resolveScopedBanks(config);
 	const memories = new Map<string, MnemopiScopedMemory>();
 	const open = (bank: string): MnemopiScopedMemory => {
@@ -636,19 +698,47 @@ function resolveScopedBanks(config: MnemopiBackendConfig): {
 } {
 	const scoping = config.scoping ?? "per-project";
 	const retainBank = config.retainBank ?? config.bank;
-	const globalBank = config.globalBank ?? config.baseBank ?? config.bank;
+	const globalBank = config.globalBank ?? config.baseBank ?? "default";
 	const recallBanks =
-		config.recallBanks ?? (scoping === "per-project-tagged" ? uniqueBanks([retainBank, globalBank]) : [retainBank]);
-	return { scoping, globalBank, retainBank, recallBanks };
+		config.recallBanks ??
+		(scoping === "per-project-tagged"
+			? uniqueBanks([retainBank, globalBank])
+			: scoping === "global"
+				? [globalBank]
+				: [retainBank]);
+	// Defensive: never let a stale/hand-built config silently expand
+	// per-project recall into the shared bank.
+	const boundedRecall =
+		scoping === "per-project"
+			? uniqueBanks(recallBanks.filter(bank => bank !== globalBank || bank === retainBank))
+			: uniqueBanks(recallBanks);
+	return {
+		scoping,
+		globalBank,
+		retainBank,
+		recallBanks: boundedRecall.length > 0 ? boundedRecall : [retainBank],
+	};
 }
 
 export function getMnemopiScopedDbPaths(config: MnemopiBackendConfig): readonly string[] {
 	return getMnemopiScopedBanks(config).map(bank => resolveBankDbPath(config, bank));
 }
 
+/**
+ * Banks this config may open for clear/stats/edit routing.
+ *
+ * Uses the explicit `scopedBanks` list from {@link loadMnemopiConfig} when
+ * present so project-local modes never inherit the shared bank by accident.
+ */
 export function getMnemopiScopedBanks(config: MnemopiBackendConfig): readonly string[] {
+	if (config.scopedBanks && config.scopedBanks.length > 0) {
+		return uniqueBanks(config.scopedBanks);
+	}
 	const banks = resolveScopedBanks(config);
-	return uniqueBanks([banks.retainBank, banks.globalBank, ...banks.recallBanks]);
+	if (banks.scoping === "per-project-tagged") {
+		return uniqueBanks([banks.retainBank, banks.globalBank, ...banks.recallBanks]);
+	}
+	return uniqueBanks([banks.retainBank, ...banks.recallBanks]);
 }
 
 function dedupeScopedTargets(targets: readonly MnemopiScopedMemory[]): readonly MnemopiScopedMemory[] {
@@ -730,6 +820,8 @@ function createMemory(config: MnemopiBackendConfig, bank: string): Mnemopi {
 		channelId: bank,
 		...providerOptions,
 		proactiveLinking: config.proactiveLinking,
+		polyphonicRecall: config.polyphonicRecall,
+		enhancedRecall: config.enhancedRecall,
 	} as ConstructorParameters<typeof Mnemopi>[0]);
 }
 

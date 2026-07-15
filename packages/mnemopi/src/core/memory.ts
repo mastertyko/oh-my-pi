@@ -44,6 +44,10 @@ export interface MnemopiOptions {
 	readonly llmModel?: string | Model<Api>;
 	readonly llm?: false | MnemopiLlmRuntimeOptions | Model<Api> | MnemopiLlmCompletion;
 	readonly proactiveLinking?: boolean;
+	/** Per-instance polyphonic recall; env MNEMOPI_POLYPHONIC_RECALL still wins when set. */
+	readonly polyphonicRecall?: boolean;
+	/** Per-instance enhanced recall/query-cache; env MNEMOPI_ENHANCED_RECALL still wins when set. */
+	readonly enhancedRecall?: boolean;
 	/** Escalate best-effort failure logs (embedding pipeline) from debug to warn. */
 	readonly debug?: boolean;
 	/**
@@ -409,6 +413,8 @@ export class Mnemopi {
 			authorType: this.authorType,
 			channelId: this.channelId,
 			proactiveLinking: options.proactiveLinking,
+			polyphonicRecall: options.polyphonicRecall,
+			enhancedRecall: options.enhancedRecall,
 		});
 		this.#ownsDb = options.db === undefined;
 		if (options.db !== undefined) {
@@ -440,6 +446,20 @@ export class Mnemopi {
 		if (this.#closed) return;
 		this.#closed = true;
 		if (this.#ownsDb) this.beam.close();
+	}
+
+	/**
+	 * Hot-patch per-instance recall feature gates without reopening SQLite.
+	 * Environment variables still override these when set.
+	 */
+	setRecallFeatures(flags: {
+		polyphonicRecall?: boolean;
+		enhancedRecall?: boolean;
+		proactiveLinking?: boolean;
+	}): void {
+		if (flags.polyphonicRecall !== undefined) this.beam.config.polyphonicRecall = flags.polyphonicRecall;
+		if (flags.enhancedRecall !== undefined) this.beam.config.enhancedRecall = flags.enhancedRecall;
+		if (flags.proactiveLinking !== undefined) this.beam.config.proactiveLinking = flags.proactiveLinking;
 	}
 
 	async flushExtractions(): Promise<void> {

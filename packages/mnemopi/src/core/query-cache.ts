@@ -44,8 +44,20 @@ export function isEnhancedRecallEnabled(env: Env = process.env): boolean {
 	return enhancedRecallEnabled(env);
 }
 
-export function isQueryCacheEnabled(useCache = true, env: Env = process.env): boolean {
-	return useCache && isEnhancedRecallEnabled(env);
+/**
+ * Whether the query-cache path should run.
+ *
+ * When `instanceEnhanced` is provided (from `beam.config.enhancedRecall`), it
+ * is the host default and still loses to an explicit `MNEMOPI_ENHANCED_RECALL`
+ * env override. When omitted, only the process-global configure/env gate applies
+ * (legacy callers / tests).
+ */
+export function isQueryCacheEnabled(useCache = true, env: Env = process.env, instanceEnhanced?: boolean): boolean {
+	if (!useCache) return false;
+	const envValue = env.MNEMOPI_ENHANCED_RECALL;
+	if (envValue !== undefined && envValue !== "") return envValue === "1";
+	if (instanceEnhanced !== undefined) return instanceEnhanced;
+	return isEnhancedRecallEnabled(env);
 }
 
 export class QueryCache {

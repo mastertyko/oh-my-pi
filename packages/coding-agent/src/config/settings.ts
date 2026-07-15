@@ -1051,6 +1051,49 @@ export class Settings {
 			delete raw.mnemosyne;
 		}
 
+		// Normalize legacy top-level memory flags into explicit mnemopi fields.
+		// Older configs nested `enabled` / `enhanced` / `polyphonic` under
+		// `memories` or `mnemosyne` without project-bounded scoping. After
+		// migration, runtime always sees explicit `memory.backend` +
+		// `mnemopi.*` with project-isolated defaults unless the user set
+		// `scoping: "global"` / `"per-project-tagged"`.
+		const mnemopiObj = (raw.mnemopi as Record<string, unknown> | undefined) ?? undefined;
+		const legacyMemories = raw.memories as Record<string, unknown> | undefined;
+		if (mnemopiObj || legacyMemories) {
+			const target = (mnemopiObj ?? {}) as Record<string, unknown>;
+			let touched = false;
+			const promoteBool = (from: Record<string, unknown> | undefined, key: string, dest: string): void => {
+				if (!from || !(key in from)) return;
+				if (!(dest in target) && typeof from[key] === "boolean") {
+					target[dest] = from[key];
+					touched = true;
+				}
+				// Drop non-schema legacy keys so they cannot re-surface as
+				// accidental global-enabling defaults on later reloads.
+				if (key === "enhanced" || key === "polyphonic") {
+					delete from[key];
+					touched = true;
+				}
+			};
+			promoteBool(legacyMemories, "enhanced", "enhancedRecall");
+			promoteBool(legacyMemories, "polyphonic", "polyphonicRecall");
+			promoteBool(target, "enhanced", "enhancedRecall");
+			promoteBool(target, "polyphonic", "polyphonicRecall");
+			// Invalid/missing scoping falls through to the schema default
+			// (`per-project`) via loadMnemopiConfig — never leave a truthy
+			// non-enum value that could be misread as shared.
+			if ("scoping" in target) {
+				const scoping = target.scoping;
+				if (scoping !== "global" && scoping !== "per-project" && scoping !== "per-project-tagged") {
+					delete target.scoping;
+					touched = true;
+				}
+			}
+			if (touched || !mnemopiObj) {
+				raw.mnemopi = target;
+			}
+		}
+
 		// hindsight: dynamicBankId/agentName -> scoping enum + bankId
 		// - dynamicBankId=true  → scoping="per-project" (closest semantic match;
 		//   the legacy `agent::project::channel::user` tuple was per-project in
@@ -1477,6 +1520,25 @@ const SETTING_HOOKS: Partial<Record<SettingPath, SettingHook<any>>> = {
 	"hindsight.bankId": () => hindsightScopeSignal.fire(),
 	"hindsight.bankIdPrefix": () => hindsightScopeSignal.fire(),
 	"hindsight.scoping": () => hindsightScopeSignal.fire(),
+	// Mnemopi runtime policy (auto-recall/retain, feature flags, limits). Bank
+	// routing keys also fire so hosts can rebuild when scope drifts.
+	"mnemopi.autoRecall": () => mnemopiRuntimeSignal.fire(),
+	"mnemopi.autoRetain": () => mnemopiRuntimeSignal.fire(),
+	"mnemopi.polyphonicRecall": () => mnemopiRuntimeSignal.fire(),
+	"mnemopi.enhancedRecall": () => mnemopiRuntimeSignal.fire(),
+	"mnemopi.proactiveLinking": () => mnemopiRuntimeSignal.fire(),
+	"mnemopi.retainEveryNTurns": () => mnemopiRuntimeSignal.fire(),
+	"mnemopi.recallLimit": () => mnemopiRuntimeSignal.fire(),
+	"mnemopi.recallContextTurns": () => mnemopiRuntimeSignal.fire(),
+	"mnemopi.recallMaxQueryChars": () => mnemopiRuntimeSignal.fire(),
+	"mnemopi.injectionTokenLimit": () => mnemopiRuntimeSignal.fire(),
+	"mnemopi.debug": () => mnemopiRuntimeSignal.fire(),
+	"mnemopi.scoping": () => {
+		mnemopiRuntimeSignal.fire();
+		mnemopiScopeSignal.fire();
+	},
+	"mnemopi.bank": () => mnemopiScopeSignal.fire(),
+	"mnemopi.dbPath": () => mnemopiScopeSignal.fire(),
 	"worktree.base": value => {
 		const dir = typeof value === "string" && value.trim() ? value : undefined;
 		// Always call so an unset/empty value clears a previously-applied override.
@@ -1528,6 +1590,28 @@ const hindsightScopeSignal = new SettingSignal("hindsight scope");
  * caller is expected to re-read the relevant settings via `Settings.get`.
  */
 export const onHindsightScopeChanged = (cb: () => void) => hindsightScopeSignal.on(cb);
+
+/** Fires when mnemopi auto-recall/retain/feature-flag/limit settings change. */
+const mnemopiRuntimeSignal = new SettingSignal("mnemopi runtime");
+
+/**
+ * Subscribe to live Mnemopi runtime-policy settings (`autoRecall`,
+ * `autoRetain`, polyphonic/enhanced recall, limits, debug). The active
+ * `MnemopiSessionState` re-reads {@link loadMnemopiRuntimePolicy} and hot-patches
+ * its config so selector/settings changes affect the same backend instance
+ * that tools and auto-recall already use.
+ */
+export const onMnemopiRuntimeChanged = (cb: () => void) => mnemopiRuntimeSignal.on(cb);
+
+/** Fires when mnemopi bank routing settings change (scoping/bank/dbPath). */
+const mnemopiScopeSignal = new SettingSignal("mnemopi scope");
+
+/**
+ * Subscribe to Mnemopi bank-routing setting changes. Hosts that keep open
+ * SQLite handles should rebuild the session state when these fire — hot-patch
+ * alone cannot retarget banks.
+ */
+export const onMnemopiScopeChanged = (cb: () => void) => mnemopiScopeSignal.on(cb);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Global Singleton

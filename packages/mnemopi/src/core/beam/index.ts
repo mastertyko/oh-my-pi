@@ -70,12 +70,16 @@ const DEFAULT_CONFIG: BeamConfig = {
 	localLlmEnabled: false,
 	maxEpisodeChars: 100_000,
 	proactiveLinking: false,
+	polyphonicRecall: false,
+	enhancedRecall: false,
 };
 
 function normalizeConfig(options: BeamMemoryOptions): BeamConfig {
 	const configured = options.config ?? {};
 	const useCloud = options.useCloud ?? configured.useCloud ?? DEFAULT_CONFIG.useCloud;
 	const proactiveLinking = options.proactiveLinking ?? configured.proactiveLinking ?? proactiveLinkingEnabled({});
+	const polyphonicRecall = options.polyphonicRecall ?? configured.polyphonicRecall ?? false;
+	const enhancedRecall = options.enhancedRecall ?? configured.enhancedRecall ?? false;
 	return {
 		workingMemoryLimit: configured.workingMemoryLimit ?? DEFAULT_CONFIG.workingMemoryLimit,
 		workingMemoryTtlHours: configured.workingMemoryTtlHours ?? DEFAULT_CONFIG.workingMemoryTtlHours,
@@ -87,6 +91,8 @@ function normalizeConfig(options: BeamMemoryOptions): BeamConfig {
 		localLlmEnabled: configured.localLlmEnabled ?? DEFAULT_CONFIG.localLlmEnabled,
 		maxEpisodeChars: configured.maxEpisodeChars ?? maxEpisodeChars(),
 		proactiveLinking,
+		polyphonicRecall,
+		enhancedRecall,
 	};
 }
 function autoMigrateAnnotations(db: Database, dbPath: string | undefined): void {

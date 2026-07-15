@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Mnemopi project isolation so default/local `per-project` config no longer opens or clears the shared/global bank for clear/stats/edit routing. Under `per-project-tagged`, shared-bank rows remain recall-visible but `memory_edit` update/forget/invalidate never mutates them. Legacy `memories`/`mnemosyne` enhanced/polyphonic shapes normalize into explicit `mnemopi.*` fields with project-bounded scoping unless the user selects `global` or `per-project-tagged`.
+- Fixed Mnemopi legacy-bank rescue to inspect both `working_memory` and `episodic_memory` for cwd safety (episodic-only single-cwd banks are rescued; mixed-cwd rows in either table reject the bank).
+- Fixed Mnemopi runtime policy drift: selector/settings changes to `autoRecall`, `autoRetain`, polyphonic/enhanced recall, and related limits now hot-patch the live session config and per-instance beam feature gates (same source of truth as `loadMnemopiConfig`) without process-global `configureRecallFeatures` clobber between concurrent sessions.
+
 ## [17.0.0] - 2026-07-15
 
 ### Breaking Changes

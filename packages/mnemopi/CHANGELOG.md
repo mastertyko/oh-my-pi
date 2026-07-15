@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Made polyphonic/enhanced/proactive recall feature gates per `BeamMemory` / `Mnemopi` instance (constructor options + `setRecallFeatures`) so concurrent hosts no longer clobber each other through process-global `configureRecallFeatures`. Environment variables still override instance flags when set.
+
+
 ## [16.3.9] - 2026-07-06
 
 ### Fixed

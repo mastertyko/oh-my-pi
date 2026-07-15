@@ -590,6 +590,23 @@ describe("Settings", () => {
 			expect(settings.get("mnemopi.dbPath")).toBe("/tmp/new.db");
 		});
 
+		it("promotes legacy memories enhanced/polyphonic flags into mnemopi without global scoping", async () => {
+			await writeSettings({
+				memories: { enabled: true, enhanced: true, polyphonic: true },
+				mnemosyne: { scoping: "not-a-real-scope", enhanced: true },
+			});
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			// memories.enabled maps to local when memory.backend was unset.
+			expect(settings.get("memory.backend")).toBe("local");
+			expect(settings.get("mnemopi.enhancedRecall")).toBe(true);
+			expect(settings.get("mnemopi.polyphonicRecall")).toBe(true);
+			// Invalid legacy scoping is dropped so the schema default (per-project)
+			// keeps project-local banks until the user opts into global/tagged.
+			expect(settings.get("mnemopi.scoping")).toBe("per-project");
+		});
+
 		it("migrates boolean task.eager/todo.eager true to always", async () => {
 			await writeSettings({
 				task: { eager: true },

@@ -8,6 +8,7 @@ import type { DiagnosticSummary } from "@oh-my-pi/pi-mnemopi/diagnose";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import { resolveRoleSelection } from "../config/model-resolver";
+import { onMnemopiRuntimeChanged } from "../config/settings";
 import type {
 	MemoryBackend,
 	MemoryBackendSaveInput,
@@ -23,6 +24,7 @@ import { tinyModelClient } from "../tiny/title-client";
 import { shortenPath } from "../tools/render-utils";
 import {
 	loadMnemopiConfig,
+	loadMnemopiRuntimePolicy,
 	type MnemopiBackendConfig,
 	type MnemopiProviderOptions,
 	truncateApproxTokens,
@@ -91,6 +93,15 @@ export const mnemopiBackend: MemoryBackend = {
 			const config = await loadMnemopiConfigWithProviders(settings, agentDir, modelRegistry, sessionId);
 			await Promise.all([loadMnemopi(), loadMnemopiCore()]);
 			const state = new MnemopiSessionState({ sessionId, config, session });
+			// Hot-patch runtime knobs from the same Settings instance that the
+			// selector writes. Bank/scope changes still need a full restart
+			// (different SQLite handles); policy-only keys apply immediately so
+			// auto-recall/auto-retain toggles affect the live backend.
+			state.unsubscribeRuntime = onMnemopiRuntimeChanged(() => {
+				const live = getMnemopiSessionState(session);
+				if (!live || live.aliasOf || live !== state) return;
+				live.applyRuntimePolicy(loadMnemopiRuntimePolicy(settings));
+			});
 			const previous = setMnemopiSessionState(session, state);
 			await previous?.dispose();
 			state.attachSessionListeners();

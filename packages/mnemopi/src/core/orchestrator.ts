@@ -1,11 +1,6 @@
 import type { BeamMemoryState, RecallOptions, RecallResult } from "./beam/types";
 import { embedQuery } from "./embeddings";
-import {
-	type PolyphonicMemoryResult,
-	type PolyphonicRecallOptions,
-	polyphonicRecall,
-	polyphonicRecallIsEnabled,
-} from "./polyphonic-recall";
+import { type PolyphonicMemoryResult, type PolyphonicRecallOptions, polyphonicRecall } from "./polyphonic-recall";
 
 export interface OrchestratorBeam extends BeamMemoryState {
 	recall?: (query: string, topK?: number, options?: RecallOptions) => Promise<RecallResult[]>;
@@ -42,7 +37,14 @@ export async function orchestrateRecall(
 	topK = 20,
 	options: OrchestrateRecallOptions = {},
 ): Promise<OrchestratedRecallResult[]> {
-	const polyphonic = !options.forceLinear && (options.forcePolyphonic === true || polyphonicRecallIsEnabled());
+	// force* options are absolute. Otherwise env wins when set; else the
+	// per-instance beam.config flag. Never consult process-global
+	// configureRecallFeatures() defaults — concurrent hosts must not clobber
+	// each other.
+	const polyphonic =
+		!options.forceLinear &&
+		(options.forcePolyphonic === true ||
+			envFeatureOrInstance("MNEMOPI_POLYPHONIC_RECALL", beam.config.polyphonicRecall === true));
 	let queryEmbedding: readonly number[] | Float32Array | null | undefined = options.queryEmbedding;
 	if (queryEmbedding === undefined && query.length > 0) {
 		// Auto-derive when the caller did not pass one. `embedQuery()` returns null when
@@ -54,9 +56,17 @@ export async function orchestrateRecall(
 		return polyphonicRecall(beam, query, topK, { ...options, queryEmbedding });
 	}
 	const linearOptions = toLinearRecallOptions({ ...options, queryEmbedding });
-	if (options.enhanced === true && typeof beam.recallEnhanced === "function") {
+	const enhanced =
+		options.enhanced === true || envFeatureOrInstance("MNEMOPI_ENHANCED_RECALL", beam.config.enhancedRecall === true);
+	if (enhanced && typeof beam.recallEnhanced === "function") {
 		return beam.recallEnhanced(query, topK, linearOptions);
 	}
 	if (typeof beam.recall === "function") return beam.recall(query, topK, linearOptions);
 	return [];
+}
+
+function envFeatureOrInstance(envName: string, instanceEnabled: boolean): boolean {
+	const value = process.env[envName];
+	if (value !== undefined && value !== "") return value === "1";
+	return instanceEnabled;
 }

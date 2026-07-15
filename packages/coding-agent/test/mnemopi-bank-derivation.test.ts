@@ -28,8 +28,12 @@ afterAll(async () => {
 
 // Schema mirrors the subset of `packages/mnemopi/src/core/beam/schema.ts`
 // that this code path needs to probe. We deliberately do not run the
-// full schema setup — the cwd-probing query only touches working_memory.
-function createBankFixture(bank: string, metadataRows: readonly Record<string, unknown>[]): void {
+// full schema setup — the cwd-probing query only touches durable memory tables.
+function createBankFixture(
+	bank: string,
+	workingRows: readonly Record<string, unknown>[],
+	episodicRows: readonly Record<string, unknown>[] = [],
+): void {
 	const bankDir = path.join(banksDir, bank);
 	const dbPath = path.join(bankDir, "mnemopi.db");
 	mkdirSync(bankDir, { recursive: true });
@@ -40,11 +44,20 @@ function createBankFixture(bank: string, metadataRows: readonly Record<string, u
 				id TEXT PRIMARY KEY,
 				content TEXT,
 				metadata_json TEXT
-			)
+			);
+			CREATE TABLE IF NOT EXISTS episodic_memory (
+				id TEXT PRIMARY KEY,
+				content TEXT,
+				metadata_json TEXT
+			);
 		`);
-		const insert = db.prepare("INSERT INTO working_memory (id, content, metadata_json) VALUES (?, ?, ?)");
-		for (const [index, meta] of metadataRows.entries()) {
-			insert.run(`row-${bank}-${index}`, "content", JSON.stringify(meta));
+		const insertWorking = db.prepare("INSERT INTO working_memory (id, content, metadata_json) VALUES (?, ?, ?)");
+		for (const [index, meta] of workingRows.entries()) {
+			insertWorking.run(`wm-${bank}-${index}`, "content", JSON.stringify(meta));
+		}
+		const insertEpisodic = db.prepare("INSERT INTO episodic_memory (id, content, metadata_json) VALUES (?, ?, ?)");
+		for (const [index, meta] of episodicRows.entries()) {
+			insertEpisodic.run(`ep-${bank}-${index}`, "content", JSON.stringify(meta));
 		}
 	} finally {
 		db.close();
@@ -121,6 +134,31 @@ describe("extendRecallWithLegacyBanks (#2412)", () => {
 		]);
 		const extended = extendRecallWithLegacyBanks(["active-bank"], mainDbPath, childCwd);
 		expect(extended).not.toContain("mixed-cwd-legacy");
+	});
+
+	it("rescues episodic-only banks when every episodic row tags the active cwd", () => {
+		const activeCwd = path.join(rootDir.path(), "projects", "episodic-only");
+		createBankFixture("legacy-episodic-only", [], [{ cwd: activeCwd }]);
+		const extended = extendRecallWithLegacyBanks(["active-bank"], mainDbPath, activeCwd);
+		expect(extended).toContain("legacy-episodic-only");
+	});
+
+	it("rejects banks whose working rows match cwd but episodic rows mix cwds", () => {
+		const activeCwd = path.join(rootDir.path(), "projects", "mixed-tables");
+		createBankFixture(
+			"legacy-mixed-tables",
+			[{ cwd: activeCwd }],
+			[{ cwd: activeCwd }, { cwd: path.join(rootDir.path(), "projects", "other") }],
+		);
+		const extended = extendRecallWithLegacyBanks(["active-bank"], mainDbPath, activeCwd);
+		expect(extended).not.toContain("legacy-mixed-tables");
+	});
+
+	it("does not admit empty durable banks", () => {
+		const activeCwd = path.join(rootDir.path(), "projects", "empty-bank");
+		createBankFixture("legacy-empty", [], []);
+		const extended = extendRecallWithLegacyBanks(["active-bank"], mainDbPath, activeCwd);
+		expect(extended).not.toContain("legacy-empty");
 	});
 });
 
