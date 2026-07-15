@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed unknown `__omp_worker_*` CLI selectors exiting 0 with no error: unrecognized worker host selectors now fail immediately with a clear stderr message and a nonzero exit code instead of falling through as a silent success.
+
 ## [17.0.0] - 2026-07-15
 
 ### Breaking Changes
