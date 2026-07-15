@@ -411,6 +411,15 @@ export class SelectorController {
 				});
 				break;
 
+			case "memory.backend":
+				// Atomic dispose → start → tool rebuild → prompt refresh so the
+				// selected backend is live for tools, auto listeners, and the next
+				// system prompt without requiring a session restart.
+				void this.ctx.session.applyMemoryBackend().catch(err => {
+					this.ctx.showError(`Failed to apply memory backend: ${err}`);
+				});
+				break;
+
 			case "autocompleteMaxVisible":
 				this.ctx.editor.setAutocompleteMaxVisible(typeof value === "number" ? value : Number(value));
 				break;

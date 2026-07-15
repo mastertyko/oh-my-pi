@@ -11,6 +11,7 @@ export type {
 	MnemopiSessionState,
 	MnemopiSessionStateOptions,
 } from "../mnemopi/state";
+export * from "./lifecycle";
 export * from "./local-backend";
 export * from "./off-backend";
 export * from "./resolve";

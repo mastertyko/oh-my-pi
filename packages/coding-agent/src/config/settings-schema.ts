@@ -2420,8 +2420,8 @@ export const SETTINGS_SCHEMA = {
 
 	// Memory backend selector — picks between local memories pipeline,
 	// Mnemopi local SQLite, Hindsight remote memory, or off. Legacy
-	// `memories.enabled` keeps gating the local backend; see config/settings.ts
-	// migration for details.
+	// `memories.enabled` is migration input only; runtime selection is solely
+	// `memory.backend` (see config/settings.ts migration).
 	"memory.backend": {
 		type: "enum",
 		values: ["off", "local", "hindsight", "mnemopi"] as const,

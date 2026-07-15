@@ -119,6 +119,9 @@ interface ConsolidationOutputSchema {
  * Start the background memory startup pipeline.
  *
  * Skips for ephemeral sessions, subagent sessions, disabled settings, or DB failures.
+ * Each session owns a cancellable generation: switching backends or disposing the
+ * session aborts prior work so phase/DB/prompt side-effects cannot land after
+ * ownership ends. Cancellation is per-session (never global).
  */
 export function startMemoryStartupTask(options: {
 	session: AgentSession;
@@ -142,9 +145,20 @@ export function startMemoryStartupTask(options: {
 		return;
 	}
 
-	void runMemoryStartup({ session, settings, modelRegistry, agentDir, config: cfg }).catch(error => {
-		logger.warn("Memory startup failed", { error: String(error) });
-	});
+	// Prefer the session-owned AbortController when available (AgentSession).
+	// Minimal fixtures without beginLocalMemoryStartup keep the fire-and-forget path.
+	const begin = session.beginLocalMemoryStartup?.bind(session);
+	const end = session.endLocalMemoryStartup?.bind(session);
+	const signal = begin ? begin() : undefined;
+
+	void runMemoryStartup({ session, settings, modelRegistry, agentDir, config: cfg, signal })
+		.catch(error => {
+			if (signal?.aborted) return;
+			logger.warn("Memory startup failed", { error: String(error) });
+		})
+		.finally(() => {
+			if (signal && end) end(signal);
+		});
 }
 
 interface MemoryInstructionSession {
@@ -315,16 +329,32 @@ export function enqueueMemoryConsolidation(agentDir: string, cwd: string, source
 	}
 }
 
+function isLocalMemoryStartupCurrent(
+	session: AgentSession,
+	settings: Settings,
+	signal: AbortSignal | undefined,
+): boolean {
+	if (signal?.aborted) return false;
+	if (session.isDisposed) return false;
+	return settings.get("memory.backend") === "local";
+}
+
 async function runMemoryStartup(options: {
 	session: AgentSession;
 	settings: Settings;
 	modelRegistry: ModelRegistry;
 	agentDir: string;
 	config: MemoryRuntimeConfig;
+	signal?: AbortSignal;
 }): Promise<void> {
+	const { session, settings, signal } = options;
+	if (!isLocalMemoryStartupCurrent(session, settings, signal)) return;
 	await runPhase1(options);
+	if (!isLocalMemoryStartupCurrent(session, settings, signal)) return;
 	await runPhase2(options);
+	if (!isLocalMemoryStartupCurrent(session, settings, signal)) return;
 	await refreshMemoryToolDeveloperInstructionsCacheAfterStartup(options.session, options.agentDir, options.settings);
+	if (!isLocalMemoryStartupCurrent(session, settings, signal)) return;
 	await options.session.refreshBaseSystemPrompt?.();
 }
 
@@ -334,8 +364,10 @@ async function runPhase1(options: {
 	modelRegistry: ModelRegistry;
 	agentDir: string;
 	config: MemoryRuntimeConfig;
+	signal?: AbortSignal;
 }): Promise<void> {
-	const { session, modelRegistry, agentDir, config } = options;
+	const { session, modelRegistry, agentDir, config, settings, signal } = options;
+	if (!isLocalMemoryStartupCurrent(session, settings, signal)) return;
 	const db = openMemoryDb(getAgentDbPath(agentDir));
 	const nowSec = unixNow();
 	const workerId = `memory-${process.pid}`;
@@ -343,9 +375,10 @@ async function runPhase1(options: {
 	const currentThreadId = session.sessionManager.getSessionId();
 
 	try {
+		if (!isLocalMemoryStartupCurrent(session, settings, signal)) return;
 		const threads = await collectThreads(session, currentThreadId);
+		if (!isLocalMemoryStartupCurrent(session, settings, signal)) return;
 		upsertThreads(db, threads);
-
 		const phase1Model = await resolveMemoryModel({
 			modelRegistry,
 			session,
@@ -364,6 +397,7 @@ async function runPhase1(options: {
 			return;
 		}
 
+		if (!isLocalMemoryStartupCurrent(session, settings, signal)) return;
 		const claims = claimStage1Jobs(db, {
 			nowSec,
 			threadScanLimit: config.threadScanLimit,
@@ -387,6 +421,7 @@ async function runPhase1(options: {
 		};
 
 		await runWithConcurrency(claims, config.stage1Concurrency, async claim => {
+			if (!isLocalMemoryStartupCurrent(session, settings, signal)) return;
 			const result = await runStage1Job({
 				claim,
 				model: phase1Model,
@@ -466,8 +501,10 @@ async function runPhase2(options: {
 	modelRegistry: ModelRegistry;
 	agentDir: string;
 	config: MemoryRuntimeConfig;
+	signal?: AbortSignal;
 }): Promise<void> {
-	const { session, modelRegistry, agentDir, config } = options;
+	const { session, modelRegistry, agentDir, config, settings, signal } = options;
+	if (!isLocalMemoryStartupCurrent(session, settings, signal)) return;
 	const cwd = session.sessionManager.getCwd();
 	const db = openMemoryDb(getAgentDbPath(agentDir));
 	const nowSec = unixNow();
@@ -475,6 +512,7 @@ async function runPhase2(options: {
 	const memoryRoot = getMemoryRoot(agentDir, cwd);
 
 	try {
+		if (!isLocalMemoryStartupCurrent(session, settings, signal)) return;
 		const claimResult = tryClaimGlobalPhase2Job(db, {
 			workerId,
 			leaseSeconds: config.phase2LeaseSeconds,
@@ -487,9 +525,12 @@ async function runPhase2(options: {
 		const outputs = listStage1OutputsForGlobal(db, config.maxRawMemoriesForGlobal, cwd);
 		const newWatermark = computeCompletionWatermark(claim.inputWatermark, outputs);
 
+		if (!isLocalMemoryStartupCurrent(session, settings, signal)) return;
 		await syncPhase2Artifacts(memoryRoot, outputs);
 		if (outputs.length === 0) {
+			if (!isLocalMemoryStartupCurrent(session, settings, signal)) return;
 			await cleanupConsolidatedArtifacts(memoryRoot);
+			if (!isLocalMemoryStartupCurrent(session, settings, signal)) return;
 			const marked = markGlobalPhase2Succeeded(db, {
 				ownershipToken: claim.ownershipToken,
 				newWatermark,
@@ -502,12 +543,14 @@ async function runPhase2(options: {
 			return;
 		}
 
+		if (!isLocalMemoryStartupCurrent(session, settings, signal)) return;
 		const phase2Model = await resolveMemoryModel({
 			modelRegistry,
 			session,
 			fallbackRole: "smol",
 		});
 		if (!phase2Model) {
+			if (!isLocalMemoryStartupCurrent(session, settings, signal)) return;
 			markPhase2FailureWithFallback(db, {
 				claim,
 				retryDelaySeconds: config.phase2RetryDelaySeconds,
@@ -519,6 +562,7 @@ async function runPhase2(options: {
 		}
 		const phase2ApiKey = await modelRegistry.getApiKey(phase2Model, session.sessionId);
 		if (!phase2ApiKey) {
+			if (!isLocalMemoryStartupCurrent(session, settings, signal)) return;
 			markPhase2FailureWithFallback(db, {
 				claim,
 				retryDelaySeconds: config.phase2RetryDelaySeconds,
@@ -544,13 +588,16 @@ async function runPhase2(options: {
 		}, config.phase2HeartbeatSeconds * 1000);
 
 		try {
+			if (!isLocalMemoryStartupCurrent(session, settings, signal)) return;
 			const consolidated = await runConsolidationModel({
 				memoryRoot,
 				model: phase2Model,
 				apiKey: modelRegistry.resolver(phase2Model, session.sessionId),
 				metadata: session.agent?.metadataForProvider(phase2Model.provider),
 			});
+			if (!isLocalMemoryStartupCurrent(session, settings, signal)) return;
 			await applyConsolidation(memoryRoot, consolidated);
+			if (!isLocalMemoryStartupCurrent(session, settings, signal)) return;
 			if (heartbeatLostOwnership) {
 				throw new Error("Phase2 lease ownership lost before completion");
 			}
@@ -1227,7 +1274,7 @@ async function resolveMemoryModel(options: {
 
 function loadMemoryConfig(settings: Settings): MemoryRuntimeConfig {
 	return {
-		enabled: settings.get("memory.backend") === "local" || settings.get("memories.enabled") === true,
+		enabled: settings.get("memory.backend") === "local",
 		maxRolloutsPerStartup: settings.get("memories.maxRolloutsPerStartup") ?? DEFAULTS.maxRolloutsPerStartup,
 		maxRolloutAgeDays: settings.get("memories.maxRolloutAgeDays") ?? DEFAULTS.maxRolloutAgeDays,
 		minRolloutIdleHours: settings.get("memories.minRolloutIdleHours") ?? DEFAULTS.minRolloutIdleHours,

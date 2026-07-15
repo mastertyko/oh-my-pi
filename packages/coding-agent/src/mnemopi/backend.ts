@@ -129,12 +129,37 @@ export const mnemopiBackend: MemoryBackend = {
 		requireMnemopiCore().resetMemoryForTests();
 		await Bun.sleep(0);
 		await removeDbFiles(getMnemopiScopedDbPaths(config));
+
+		// Rehydrate an empty but active backend in the same session so manual tools
+		// and auto listeners work immediately after /memory clear (without requiring
+		// a session restart). Aliased subagents keep their parent banks and do not
+		// re-own primary state here.
+		if (!session?.sessionId || previous?.aliasOf) return;
+		try {
+			await Promise.all([loadMnemopi(), loadMnemopiCore()]);
+			const state = new MnemopiSessionState({
+				sessionId: session.sessionId,
+				config,
+				session,
+			});
+			const displaced = setMnemopiSessionState(session, state);
+			await displaced?.dispose({ consolidate: false });
+			state.attachSessionListeners();
+		} catch (error) {
+			logger.warn("Mnemopi: clear rehydrate failed; memory backend inert until restart.", {
+				error: String(error),
+			});
+		}
 	},
 
 	async enqueue(agentDir, _cwd, session): Promise<void> {
 		try {
 			let state = getMnemopiSessionState(session);
-			if (!state && session) {
+			if (!state && session?.sessionId) {
+				// Share the same primary initialization path as start(): load
+				// modules, install state, attach listeners exactly once. Without
+				// attachSessionListeners, enqueue rehydrate left the backend
+				// writable for tools but inert for auto recall/retain.
 				const config = await loadMnemopiConfigWithProviders(
 					session.settings,
 					agentDir,
@@ -143,7 +168,9 @@ export const mnemopiBackend: MemoryBackend = {
 				);
 				await Promise.all([loadMnemopi(), loadMnemopiCore()]);
 				state = new MnemopiSessionState({ sessionId: session.sessionId, config, session });
-				setMnemopiSessionState(session, state);
+				const previous = setMnemopiSessionState(session, state);
+				await previous?.dispose();
+				state.attachSessionListeners();
 			}
 			await state?.consolidate();
 		} catch (error) {

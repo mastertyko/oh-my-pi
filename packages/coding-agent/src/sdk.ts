@@ -2739,6 +2739,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			skillWarnings,
 			skillsSettings: settings.getGroup("skills"),
 			modelRegistry,
+			agentDir,
+			taskDepth,
+			createMemoryToolSession: () => toolSession,
 			toolRegistry,
 			createVibeTools:
 				(options.taskDepth ?? 0) === 0 && !options.parentTaskPrefix

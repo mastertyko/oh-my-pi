@@ -36,6 +36,11 @@
 
 ### Fixed
 
+- Fixed mid-session `memory.backend` changes (Settings → Memory) so runtime state, memory tools, system-prompt injection, and auto listeners switch atomically: the previous backend is disposed, the selected backend is started, and tools/prompt rebuild immediately. Concurrent switches are serialized; a failed start leaves a coherent inert selection rather than half-switched tools.
+- Fixed `/memory clear` on the Mnemopi backend leaving the session without live state: clear now deletes scoped data then rehydrates an empty but active backend with listeners attached so manual tools and auto recall/retain work in the same session.
+- Fixed `/memory enqueue` rehydrate installing Mnemopi session state without attaching session listeners (auto recall/retain stayed inert until restart).
+- Fixed local memory startup still honouring legacy `memories.enabled` under an explicit non-local `memory.backend`; runtime enablement is now solely `memory.backend === "local"` (legacy values remain migration input only).
+
 - Fixed a bug where a nested configuration value (like `dev.autoqa.consent` / `dev.autoqaConsent`) would incorrectly satisfy a parent key lookup (like `dev.autoqa`), causing Auto QA to be enabled and prompt for consent by default when it should have been disabled.
 - Fixed compiled appserver startup deadlocking before socket creation when user extensions were present.
 - Fixed Bash internal URLs remaining unresolved when used as unquoted arguments inside command substitutions.

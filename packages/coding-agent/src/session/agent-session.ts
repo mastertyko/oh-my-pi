@@ -244,7 +244,13 @@ import type { Goal, GoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import { IrcBus, type IrcMessage } from "../irc/bus";
-import { resolveMemoryBackend } from "../memory-backend";
+import {
+	disposeLiveMemorySessionState,
+	isMemoryBackendToolName,
+	MEMORY_BACKEND_TOOL_NAMES,
+	resolveMemoryBackend,
+	startResolvedMemoryBackend,
+} from "../memory-backend";
 import { shutdownMnemopiEmbedClient } from "../mnemopi/embed-client";
 import { getMnemopiSessionState, type MnemopiSessionState, setMnemopiSessionState } from "../mnemopi/state";
 import { containsOrchestrate, ORCHESTRATE_NOTICE } from "../modes/orchestrate";
@@ -309,6 +315,7 @@ import {
 } from "../thinking";
 import { formatTitleConversationContext, type TitleConversationTurn } from "../tiny/message-preproc";
 import { shutdownTinyTitleClient } from "../tiny/title-client";
+import { BUILTIN_TOOLS, type ToolSession } from "../tools";
 import { assertEditableFile } from "../tools/auto-generated-guard";
 import { releaseTabsForOwner } from "../tools/browser/tab-supervisor";
 import { isMCPToolName, normalizeToolNames } from "../tools/builtin-names";
@@ -830,6 +837,19 @@ export interface AgentSessionConfig {
 	/** Custom commands (TypeScript slash commands) */
 	customCommands?: LoadedCustomCommand[];
 	skillsSettings?: SkillsSettings;
+	/**
+	 * Agent dir used by memory backend start/clear. Required for mid-session
+	 * `memory.backend` switches and `/memory` rehydrate paths.
+	 */
+	agentDir?: string;
+	/** Task recursion depth (0 = top-level). Memory switches only run at depth 0. */
+	taskDepth?: number;
+	/**
+	 * Factory that builds a ToolSession for mid-session memory-tool rebuilds.
+	 * Captures the same closures as the SDK's initial createTools call so tools
+	 * remain bound to live session state after a backend switch.
+	 */
+	createMemoryToolSession?: () => ToolSession;
 	/** Model registry for API key resolution and model discovery */
 	modelRegistry: ModelRegistry;
 	/** Tool registry for LSP and settings */
@@ -2039,6 +2059,19 @@ export class AgentSession {
 	#synchronouslyTerminatedYieldToolCallIds = new Set<string>();
 	#providerSessionState = new Map<string, ProviderSessionState>();
 	#hindsightSessionState: HindsightSessionState | undefined = undefined;
+	/** Agent dir for mid-session memory backend start/clear. */
+	#memoryAgentDir: string | undefined;
+	/** Task depth captured at session construction (memory switches only at 0). */
+	#memoryTaskDepth = 0;
+	/** ToolSession factory used when rebuilding memory tools after a backend switch. */
+	#createMemoryToolSession: (() => ToolSession) | undefined;
+	/** Serializes concurrent applyMemoryBackend / refreshMemoryTools transitions. */
+	#memoryBackendTransition: Promise<void> = Promise.resolve();
+	/**
+	 * Per-session local-backend startup generation. Cancelled on switch/dispose so
+	 * a prior fire-and-forget pipeline cannot mutate DB/prompt after ownership ends.
+	 */
+	#localMemoryStartupAbort: AbortController | undefined;
 	readonly rawSseDebugBuffer: RawSseDebugBuffer;
 
 	#resetPromptMaintenanceState(): void {
@@ -2518,6 +2551,9 @@ export class AgentSession {
 		this.#customCommands = config.customCommands ?? [];
 		this.#skillsSettings = config.skillsSettings;
 		this.#modelRegistry = config.modelRegistry;
+		this.#memoryAgentDir = config.agentDir;
+		this.#memoryTaskDepth = config.taskDepth ?? 0;
+		this.#createMemoryToolSession = config.createMemoryToolSession;
 		// Resolve the wire service-tier per request so the Fireworks Priority
 		// toggle scopes priority to Fireworks alone, without mutating the shared
 		// session `serviceTier` that drives `/fast` and OpenAI/Anthropic priority.
@@ -6197,6 +6233,42 @@ export class AgentSession {
 		return this.#isDisposed;
 	}
 
+	/**
+	 * Cancel any in-flight local (`memory.backend=local`) startup pipeline for
+	 * this session. Safe to call repeatedly; does not affect other sessions.
+	 */
+	cancelLocalMemoryStartup(): void {
+		this.#localMemoryStartupAbort?.abort();
+		this.#localMemoryStartupAbort = undefined;
+	}
+
+	/**
+	 * Begin a new local-memory startup generation, cancelling any prior one.
+	 * Returns the AbortSignal the pipeline must poll; only the owning run may
+	 * clear the handle via {@link endLocalMemoryStartup}.
+	 */
+	beginLocalMemoryStartup(): AbortSignal {
+		this.cancelLocalMemoryStartup();
+		const controller = new AbortController();
+		this.#localMemoryStartupAbort = controller;
+		return controller.signal;
+	}
+
+	/**
+	 * Clear the local-startup handle only when `signal` still owns the slot
+	 * (so a newer generation is not wiped by an older run's finally).
+	 */
+	endLocalMemoryStartup(signal: AbortSignal): void {
+		if (this.#localMemoryStartupAbort?.signal === signal) {
+			this.#localMemoryStartupAbort = undefined;
+		}
+	}
+
+	/** Await the in-flight memory backend transition queue (no-op when idle). */
+	async awaitMemoryBackendTransition(): Promise<void> {
+		await this.#memoryBackendTransition.catch(() => undefined);
+	}
+
 	markMovedFromEmptySessionFile(sessionFile: string): void {
 		this.#movedFromEmptySessionFile = path.resolve(sessionFile);
 	}
@@ -6212,6 +6284,9 @@ export class AgentSession {
 	 */
 	beginDispose(): void {
 		this.#isDisposed = true;
+		// Stop local memory startup immediately so phase work cannot land after
+		// dispose begins; the full transition queue is joined in #doDispose.
+		this.cancelLocalMemoryStartup();
 		this.#flushPendingIrcAsides();
 		this.yieldQueue.clear();
 		this.agent.setAsideMessageProvider(undefined);
@@ -6344,6 +6419,14 @@ export class AgentSession {
 				logger.warn("Failed to disconnect owned MCP manager during dispose", { error: String(error) });
 			}
 		}
+		// Join any in-flight applyMemoryBackend/refreshMemoryTools work before the
+		// final memory teardown so a start that raced dispose cannot leave live
+		// state/listeners after we return. beginDispose already cancelled local
+		// startup; this await drains the serialized transition queue.
+		await this.#memoryBackendTransition.catch(() => undefined);
+		// One more cancel in case a late transition re-armed local startup before
+		// observing #isDisposed.
+		this.cancelLocalMemoryStartup();
 		// Flush the retain queue BEFORE clearing the session's pointer so
 		// `HindsightRetainQueue.#doFlush` still sees `session.getHindsightSessionState() === state`.
 		// Reversed, the spliced batch survives just long enough to fail the
@@ -6827,13 +6910,162 @@ export class AgentSession {
 		await this.#applyActiveToolsByName(toolNames);
 	}
 
+	/**
+	 * Atomically apply the currently selected `memory.backend` to this session:
+	 * dispose old live state, start the new backend, rebuild memory tools, and
+	 * refresh the system prompt. Concurrent calls are serialized. Failures leave
+	 * a coherent inert state (no half-switched tools routing to a disposed backend).
+	 * No-ops once the session is disposed.
+	 */
+	async applyMemoryBackend(): Promise<void> {
+		if (this.#isDisposed) return;
+		const run = this.#memoryBackendTransition.then(() => this.#applyMemoryBackendUnlocked());
+		this.#memoryBackendTransition = run.then(
+			() => undefined,
+			() => undefined,
+		);
+		await run;
+	}
+
+	async #applyMemoryBackendUnlocked(): Promise<void> {
+		if (this.#isDisposed) return;
+		// Cancel any prior local startup before switching ownership away from it.
+		this.cancelLocalMemoryStartup();
+
+		const agentDir = this.#memoryAgentDir ?? this.settings.getAgentDir?.();
+		if (!agentDir) {
+			if (this.#isDisposed) return;
+			await this.#refreshMemoryToolsUnlocked();
+			if (this.#isDisposed) return;
+			await this.refreshBaseSystemPrompt();
+			return;
+		}
+
+		if (this.#memoryTaskDepth > 0) {
+			if (this.#isDisposed) return;
+			await this.#refreshMemoryToolsUnlocked();
+			if (this.#isDisposed) return;
+			await this.refreshBaseSystemPrompt();
+			return;
+		}
+
+		const selected = this.settings.get("memory.backend");
+		try {
+			if (this.#isDisposed) return;
+			await startResolvedMemoryBackend({
+				session: this,
+				settings: this.settings,
+				modelRegistry: this.#modelRegistry,
+				agentDir,
+				taskDepth: this.#memoryTaskDepth,
+			});
+		} catch (error) {
+			logger.warn("Memory backend apply failed; tools refreshed for selection", {
+				backend: selected,
+				error: String(error),
+			});
+			if (!this.#isDisposed) {
+				await disposeLiveMemorySessionState(this, { consolidateMnemopi: true });
+			}
+		}
+
+		// If dispose began while start was in flight, tear down anything start
+		// installed and skip tool/prompt rebuild (dispose owns the final cleanup).
+		if (this.#isDisposed) {
+			await disposeLiveMemorySessionState(this, { consolidateMnemopi: false });
+			return;
+		}
+
+		await this.#refreshMemoryToolsUnlocked();
+		if (this.#isDisposed) {
+			await disposeLiveMemorySessionState(this, { consolidateMnemopi: false });
+			return;
+		}
+		await this.refreshBaseSystemPrompt();
+	}
+
+	/**
+	 * Rebuild only the memory-gated built-in tools (retain/recall/reflect/
+	 * memory_edit/learn) so the registry and active set match the current
+	 * `memory.backend` without recreating unrelated tools.
+	 */
+	async refreshMemoryTools(): Promise<void> {
+		if (this.#isDisposed) return;
+		const run = this.#memoryBackendTransition.then(() => this.#refreshMemoryToolsUnlocked());
+		this.#memoryBackendTransition = run.then(
+			() => undefined,
+			() => undefined,
+		);
+		await run;
+	}
+
+	async #refreshMemoryToolsUnlocked(): Promise<void> {
+		if (this.#isDisposed) return;
+		const createToolSession = this.#createMemoryToolSession;
+		if (!createToolSession) {
+			// Sessions without a tool-session factory (minimal test fixtures) only
+			// drop active memory tools so stale names cannot fire.
+			const nextActive = this.getEnabledToolNames().filter(name => !isMemoryBackendToolName(name));
+			await this.#applyActiveToolsByName(nextActive);
+			return;
+		}
+
+		const toolSession = createToolSession();
+		if (this.#isDisposed) return;
+		const backend = this.settings.get("memory.backend");
+		const autolearnEnabled = this.settings.get("autolearn.enabled") === true && this.#memoryTaskDepth === 0;
+
+		// Remove every previously installed memory tool so a switch cannot leave
+		// a bound tool pointing at the wrong backend (or a disposed state).
+		for (const name of MEMORY_BACKEND_TOOL_NAMES) {
+			if (this.#builtInToolNames.has(name) || this.#toolRegistry.has(name)) {
+				this.#toolRegistry.delete(name);
+				this.#builtInToolNames.delete(name);
+			}
+		}
+
+		const nextMemoryTools: AgentTool[] = [];
+		const candidateNames: string[] = [];
+		if (backend === "hindsight" || backend === "mnemopi") {
+			candidateNames.push("retain", "recall", "reflect");
+		}
+		if (backend === "mnemopi") candidateNames.push("memory_edit");
+		if (autolearnEnabled && (backend === "hindsight" || backend === "mnemopi" || backend === "local")) {
+			candidateNames.push("learn");
+		}
+
+		// Mirror createTools force-include: when the backend allows a memory tool,
+		// install it mid-session so Settings → Memory Backend takes effect without
+		// a restart. Factories still return null when their own gate fails.
+		for (const name of candidateNames) {
+			if (this.#isDisposed) return;
+			const factory = BUILTIN_TOOLS[name as keyof typeof BUILTIN_TOOLS];
+			if (!factory) continue;
+			const tool = await factory(toolSession);
+			if (!tool) continue;
+			if (this.#isDisposed) return;
+			const wrapped = this.#wrapRuntimeTool(tool as AgentTool);
+			this.#toolRegistry.set(wrapped.name, wrapped);
+			this.#builtInToolNames.add(wrapped.name);
+			nextMemoryTools.push(wrapped);
+		}
+
+		if (this.#isDisposed) return;
+		const previousEnabled = this.getEnabledToolNames();
+		const withoutMemory = previousEnabled.filter(name => !isMemoryBackendToolName(name));
+		const nextActive = [...withoutMemory, ...nextMemoryTools.map(tool => tool.name)];
+		await this.#applyActiveToolsByName(nextActive);
+	}
+
 	/** Rebuild the base system prompt using the current active tool set. */
 	async refreshBaseSystemPrompt(): Promise<void> {
+		if (this.#isDisposed) return;
 		if (!this.#rebuildSystemPrompt) return;
 		const activeToolNames = this.getActiveToolNames();
 		this.#setActiveToolNames?.(activeToolNames);
 		const previousBaseSystemPrompt = this.#baseSystemPrompt;
 		const built = await this.#rebuildSystemPrompt(activeToolNames, this.#toolRegistry);
+		if (this.#isDisposed) return;
 		this.#baseSystemPrompt = built.systemPrompt;
 		this.#baseSystemPromptBeforeMemoryPromotion = undefined;
 		if (
@@ -8121,6 +8353,13 @@ export class AgentSession {
 					messages.push(await this.#normalizeAgentMessageImages(fileMentionMessage));
 				}
 			}
+
+			// Wait for any in-flight memory backend switch so this turn's tools and
+			// system prompt observe the selected backend. The transition queue is a
+			// single shared promise (not nested under refreshBaseSystemPrompt), so
+			// awaiting it here cannot deadlock with applyMemoryBackend's own prompt refresh.
+			await this.awaitMemoryBackendTransition();
+			if (this.#isDisposed || this.#promptGeneration !== generation) return;
 
 			const beforeAgentStartSystemPrompt = await this.#buildSystemPromptForAgentStart(expandedText);
 

@@ -173,6 +173,8 @@ function registerMnemopiState(
 			} as never,
 			emitNotice: () => {},
 			getHindsightSessionState: () => undefined,
+			// Listener attach path used by start/clear/enqueue rehydrate.
+			subscribe: () => () => {},
 		} as never,
 	});
 	setMnemopiSessionState(registeredMnemopiState.session as never, registeredMnemopiState);
@@ -729,23 +731,16 @@ describe("Mnemopi backend lifecycle", () => {
 
 		await mnemopiBackend.clear(path.dirname(config.dbPath), "/work/project-alpha", session);
 
-		// The clear() contract: all scoped DB files are deleted. On Windows under
-		// bun:test, SQLite handle release may lag behind the await; poll briefly
-		// before asserting rather than failing on a transient lock.
-		const assertGone = async (p: string): Promise<void> => {
-			for (let i = 0; i < 40; i++) {
-				if (!existsSync(p)) return;
-				await Bun.sleep(25);
-			}
-		};
-		for (const dbPath of dbPaths) {
-			await assertGone(dbPath);
-			await assertGone(`${dbPath}-wal`);
-			await assertGone(`${dbPath}-shm`);
-		}
-		// Assert state was cleared even if file deletion is still in-flight.
-		expect(getMnemopiSessionState(session)).toBeUndefined();
-		registeredMnemopiState = undefined;
+		// Clear deletes scoped data then rehydrates an empty active backend. The
+		// rehydrate step opens fresh empty DBs at the same paths, so file absence
+		// is not the durable contract — empty-but-active state is.
+		const rehydrated = getMnemopiSessionState(session);
+		expect(rehydrated).toBeDefined();
+		expect(rehydrated).not.toBe(state);
+		expect(rehydrated?.aliasOf).toBeUndefined();
+		const remaining = await rehydrated!.recallResultsScoped("project clear marker");
+		expect(remaining.every(hit => !String(hit.content).includes("project clear marker"))).toBe(true);
+		registeredMnemopiState = rehydrated;
 	});
 
 	it("clear() skips consolidation before deleting the DBs (#2327 review)", async () => {
@@ -784,8 +779,11 @@ describe("Mnemopi backend lifecycle", () => {
 			expect(bank.sleep).not.toHaveBeenCalled();
 			expect(bank.close).toHaveBeenCalledTimes(1);
 		}
-		expect(getMnemopiSessionState(session)).toBeUndefined();
-		registeredMnemopiState = undefined;
+		// Old state disposed without consolidate; a fresh empty state is rehydrated.
+		const rehydrated = getMnemopiSessionState(session);
+		expect(rehydrated).toBeDefined();
+		expect(rehydrated).not.toBe(state);
+		registeredMnemopiState = rehydrated;
 	});
 
 	it("exposes direct mnemopi runtime status and search/save results", async () => {
