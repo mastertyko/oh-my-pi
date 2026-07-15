@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed HTML export/share Markdown rendering to neutralize raw HTML tokens, reject unsafe URL schemes (`javascript:`, `data:`, `vbscript:`, including control-character / HTML-entity smuggling such as `java&#9;script:`), and attribute-encode validated session image blocks so `mimeType`/payload values cannot break out of `<img>` attributes.
+
 ## [17.0.0] - 2026-07-15
 
 ### Breaking Changes

@@ -1039,7 +1039,10 @@
               if (images.length > 0) {
                 html += '<div class="message-images">';
                 for (const img of images) {
-                  html += `<img src="data:${img.mimeType};base64,${img.data}" class="message-image" />`;
+                  const src = safeImageDataUrl(img.mimeType, img.data);
+                  if (src) {
+                    html += `<img src="${escapeAttr(src)}" class="message-image" alt="" />`;
+                  }
                 }
                 html += '</div>';
               }
@@ -1358,6 +1361,112 @@
         return text.replace(/<(?=[a-zA-Z\/])/g, '&lt;');
       }
 
+      // Attribute-safe escape (quotes + ampersands) for values interpolated into HTML attributes.
+      function escapeAttr(value) {
+        return String(value)
+          .replace(/&/g, '&amp;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#39;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;');
+      }
+
+      // Decode HTML character references the way attribute parsers do, via the DOM.
+      // Prefer this over a partial named-entity allowlist: browsers expand &colon;,
+      // &Tab;, numeric refs, etc. before scheme classification. Always total/nonthrowing.
+      // Double-encoded payloads (`&amp;colon;`, `&amp;#58;`) require repeated expansion
+      // to a fixed point before scheme checks; single-pass leaves residual entities.
+      const MAX_ENTITY_DECODE_PASSES = 8;
+      const RESIDUAL_ENTITY_RE = /&(?:#x[0-9a-fA-F]{1,8}|#[0-9]{1,10}|[a-zA-Z][a-zA-Z0-9]{0,31});/i;
+
+      function decodeHtmlEntitiesOnce(value) {
+        const raw = String(value);
+        // Neutralize markup so innerHTML only expands entities, never builds nodes.
+        const escaped = raw.replace(/</g, '&lt;');
+        try {
+          const div = document.createElement('div');
+          div.innerHTML = escaped;
+          return div.textContent || '';
+        } catch {
+          return '';
+        }
+      }
+
+      function decodeHtmlEntities(value) {
+        let cur = String(value);
+        for (let i = 0; i < MAX_ENTITY_DECODE_PASSES; i++) {
+          const next = decodeHtmlEntitiesOnce(cur);
+          if (next === cur) return cur;
+          cur = next;
+        }
+        return cur;
+      }
+
+      /**
+       * Return a navigable http(s)/mailto/relative URL after full entity expansion, or null.
+       * Rejects javascript:/data:/vbscript:, control chars, entity-smuggled schemes
+       * (javascript&colon;, javascript&amp;colon;, java&#9;script:, …), and any URL that
+       * still contains residual entity candidates after bounded fixed-point decoding.
+       * Emits the fully expanded form so attributes cannot re-expand smuggled entities.
+       */
+      function sanitizeUrl(href) {
+        if (href == null) return null;
+        let decoded;
+        try {
+          decoded = decodeHtmlEntities(String(href)).trim();
+        } catch {
+          return null;
+        }
+        if (!decoded) return null;
+        // Reject C0 controls / DEL after entity expansion — browsers drop them in schemes.
+        if (/[\u0000-\u001F\u007F]/.test(decoded)) return null;
+        // If expansion did not reach a clean fixed point (still looks entity-bearing),
+        // refuse rather than emit a partially-decoded attribute browsers may finish.
+        if (RESIDUAL_ENTITY_RE.test(decoded)) return null;
+
+        // Classification form: strip replacement chars / zero-width, map colon lookalikes
+        // (HTML &Colon; → U+2237, fullwidth colon, ratio) to ASCII ":" so scheme checks
+        // match what browsers treat as scheme separators after entity expansion.
+        const classified = decoded
+          .replace(/\uFFFD/g, '')
+          .replace(/[\u200B-\u200D\uFEFF]/g, '')
+          .replace(/[\uFF1A\u2236\u2237\u02D0\uA789]/g, ':');
+        if (!classified) return null;
+
+        // Protocol-relative URLs are fine; bare relative paths too.
+        if (classified.startsWith('//')) return decoded;
+        if (
+          classified.startsWith('#') ||
+          classified.startsWith('/') ||
+          classified.startsWith('./') ||
+          classified.startsWith('../')
+        ) {
+          return decoded;
+        }
+        const schemeMatch = /^([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(classified);
+        if (!schemeMatch) {
+          // No scheme — still reject if a dangerous scheme appears after soft separators
+          // (e.g. leftover junk between "java" and "script:" from bad entities).
+          if (/^(?:javascript|data|vbscript)\s*:/i.test(classified.replace(/[^a-zA-Z0-9+.:-]+/g, ''))) {
+            return null;
+          }
+          return decoded;
+        }
+        const scheme = schemeMatch[1].toLowerCase();
+        if (scheme === 'http' || scheme === 'https' || scheme === 'mailto') return decoded;
+        return null;
+      }
+
+      // Build a data: URL for an inline image only when mime + payload are attribute-safe.
+      function safeImageDataUrl(mimeType, data) {
+        if (typeof mimeType !== 'string' || typeof data !== 'string') return null;
+        // MIME type must be a simple image/* token; reject quotes, whitespace, control chars.
+        if (!/^image\/[a-zA-Z0-9.+-]+$/.test(mimeType)) return null;
+        // Base64 payload (optionally with whitespace); reject anything that could break out of the attribute.
+        if (!/^[A-Za-z0-9+/=\s]+$/.test(data)) return null;
+        return `data:${mimeType};base64,${data.replace(/\s+/g, '')}`;
+      }
+
       // Configure marked with syntax highlighting and HTML escaping for text
       marked.use({
         breaks: true,
@@ -1391,7 +1500,32 @@
           // Inline code: escape HTML
           codespan(token) {
             return `<code>${escapeHtml(token.text)}</code>`;
-          }
+          },
+          // Raw HTML tokens: never emit as markup — show escaped source instead.
+          html(token) {
+            const raw = typeof token === 'string' ? token : (token.raw || token.text || '');
+            return escapeHtml(raw);
+          },
+          // Links: only http(s)/mailto/relative; keep label text.
+          link(token) {
+            const text = token.tokens ? this.parser.parseInline(token.tokens) : escapeHtml(token.text || '');
+            const safeHref = sanitizeUrl(token.href);
+            if (!safeHref) {
+              return text || escapeHtml(String(token.href || ''));
+            }
+            const titleAttr = token.title ? ` title="${escapeAttr(token.title)}"` : '';
+            return `<a href="${escapeAttr(safeHref)}"${titleAttr}>${text}</a>`;
+          },
+          // Markdown images: only safe schemes.
+          image(token) {
+            const alt = token.text || '';
+            const safeHref = sanitizeUrl(token.href);
+            if (!safeHref) {
+              return escapeHtml(alt || String(token.href || ''));
+            }
+            const titleAttr = token.title ? ` title="${escapeAttr(token.title)}"` : '';
+            return `<img src="${escapeAttr(safeHref)}" alt="${escapeAttr(alt)}"${titleAttr}>`;
+          },
         }
       });
 
