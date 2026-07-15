@@ -446,6 +446,58 @@ describe("readSseEvents", () => {
 		expect(events[0].data).toBe("y");
 	});
 
+	it("rejects truncated 2-byte UTF-8 sequences at EOF", async () => {
+		const stream = bytesStreamFromChunks([Uint8Array.of(0x64, 0x61, 0x74, 0x61, 0x3a, 0x20, 0xc3)]);
+		await expect(collectAsync(readSseEvents(stream))).rejects.toThrow(/Invalid byte sequence/i);
+	});
+
+	it("rejects truncated 3-byte UTF-8 sequences at EOF", async () => {
+		const stream = bytesStreamFromChunks([Uint8Array.of(0x64, 0x61, 0x74, 0x61, 0x3a, 0x20, 0xe2, 0x82)]);
+		await expect(collectAsync(readSseEvents(stream))).rejects.toThrow(/Invalid byte sequence/i);
+	});
+
+	it("rejects truncated 4-byte UTF-8 sequences at EOF", async () => {
+		const stream = bytesStreamFromChunks([Uint8Array.of(0x64, 0x61, 0x74, 0x61, 0x3a, 0x20, 0xf0, 0x9f, 0x98)]);
+		await expect(collectAsync(readSseEvents(stream))).rejects.toThrow(/Invalid byte sequence/i);
+	});
+
+	it("still recovers when a valid multi-byte sequence is split across chunks", async () => {
+		// "héllo" → bytes for 'é' are 0xC3 0xA9; split between them.
+		const full = encoder.encode("data: héllo\n\n");
+		const split = full.indexOf(0xc3) + 1;
+		const stream = bytesStreamFromChunks([full.subarray(0, split), full.subarray(split)]);
+		const [evt] = await collectAsync(readSseEvents(stream));
+		expect(evt.data).toBe("héllo");
+	});
+
+	it("keeps CRLF field parsing while failing only invalid EOF tails", async () => {
+		const stream = bytesStreamFromChunks([encoder.encode("event: a\r\ndata: 1\r\n\r\nevent: b\r\ndata: 2\r\n\r\n")]);
+		const events = await collectAsync(readSseEvents(stream));
+		expect(events.map(e => `${e.event}=${e.data}`)).toEqual(["a=1", "b=2"]);
+	});
+
+	it("treats an empty trailing buffer as EOF success", async () => {
+		const stream = bytesStreamFromChunks([encoder.encode("event: ok\ndata: done\n\n")]);
+		const events = await collectAsync(readSseEvents(stream));
+		expect(events).toEqual([{ event: "ok", data: "done", raw: ["event: ok", "data: done"] }]);
+	});
+
+	it("supports concurrent independent SSE parsers", async () => {
+		const left = bytesStreamFromChunks([encoder.encode("event: left\ndata: 1\n\n")]);
+		const right = bytesStreamFromChunks([
+			Uint8Array.of(0x64, 0x61, 0x74, 0x61, 0x3a, 0x20, 0xc3), // truncated 2-byte at EOF
+		]);
+		const [leftEvents, rightResult] = await Promise.all([
+			collectAsync(readSseEvents(left)),
+			collectAsync(readSseEvents(right)).then(
+				events => ({ ok: true as const, events }),
+				error => ({ ok: false as const, error }),
+			),
+		]);
+		expect(leftEvents.map(e => `${e.event}=${e.data}`)).toEqual(["left=1"]);
+		expect(rightResult.ok).toBe(false);
+	});
+
 	it("survives a one-byte-per-chunk drip feed without quadratic blowup", async () => {
 		// The legacy decoder rebuilt the entire string buffer per line and was
 		// O(n²) in this case. Should now complete in well under a second.

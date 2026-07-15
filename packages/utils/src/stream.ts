@@ -299,8 +299,11 @@ interface SseEventState {
 }
 
 // Complete lines are decoded in one batch per source chunk. Each batch ends on
-// LF, which cannot split a multi-byte UTF-8 sequence.
+// LF, which cannot split a multi-byte UTF-8 sequence. Streaming chunks stay
+// non-fatal so incomplete sequences can finish in a later chunk; EOF uses a
+// fatal decoder so truncated tails fail deterministically instead of U+FFFD.
 const SSE_DECODER = new TextDecoder("utf-8");
+const SSE_EOF_DECODER = new TextDecoder("utf-8", { fatal: true });
 
 function flushSseEvent(state: SseEventState): ServerSentEvent | null {
 	if (state.event === null && state.data === null) {
@@ -393,11 +396,12 @@ export async function* readSseEvents(
 			}
 		}
 		// Treat any trailing partial line (no terminating LF) as a complete line.
+		// Fatal decode rejects truncated multi-byte sequences at EOF.
 		if (!lineBuffer.isEmpty) {
 			const tail = lineBuffer.flush();
 			if (tail) {
 				lineBuffer.clear();
-				const event = pushSseLine(SSE_DECODER.decode(tail), state);
+				const event = pushSseLine(SSE_EOF_DECODER.decode(tail), state);
 				if (event) {
 					trailingEvents.add(event);
 					yield event;

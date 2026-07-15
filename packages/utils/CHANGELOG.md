@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `readSseEvents` accepting truncated multi-byte UTF-8 at EOF via U+FFFD replacement; incomplete tails now fail with a fatal decode while valid split multi-byte sequences across chunks still decode correctly.
+
 ## [17.0.0] - 2026-07-15
 
 ### Fixed
