@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Migrated legacy `dev.autoqa.consent` → `dev.autoqaConsent` and `todo.reminders.max` → `todo.remindersMax` on settings load so nested YAML/JSON no longer makes the parent path resolve to an object (which incorrectly enabled Auto QA / todo reminders). Explicit new keys win; recoverable parent booleans are preserved; irrecoverable object parents fall back to schema defaults.
+
+
 ## [17.0.0] - 2026-07-15
 
 ### Breaking Changes

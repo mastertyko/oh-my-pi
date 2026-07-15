@@ -1253,6 +1253,134 @@ export class Settings {
 		if (tierTouched) raw.tier = tierObj;
 		delete raw.fastModeScope;
 
+		// v17 renames that used to nest under a boolean parent path:
+		//   dev.autoqa.consent  -> dev.autoqaConsent
+		//   todo.reminders.max  -> todo.remindersMax
+		// Nested YAML produced by setByPath (and quoted dotted literals) made the
+		// parent path resolve to an object, so truthy checks like isAutoQaEnabled
+		// treated a consent-only tree as "autoqa on". Lift the leaf, prefer any
+		// already-explicit new key, restore a recoverable parent boolean, and
+		// otherwise drop the masquerading object so schema defaults apply.
+		const isAutoqaConsent = (value: unknown): value is "unset" | "granted" | "denied" =>
+			value === "unset" || value === "granted" || value === "denied";
+		const isFiniteNumber = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
+
+		const ensureObject = (key: string): Record<string, unknown> => {
+			const current = raw[key];
+			if (isRecord(current)) return current;
+			const created: Record<string, unknown> = {};
+			raw[key] = created;
+			return created;
+		};
+
+		// --- dev.autoqa.consent -> dev.autoqaConsent ---
+		{
+			const devObj = isRecord(raw.dev) ? raw.dev : undefined;
+			const nestedAutoqa = devObj?.autoqa;
+			const flatAutoqa = raw["dev.autoqa"];
+			const nestedOldConsent = isRecord(nestedAutoqa) ? nestedAutoqa.consent : undefined;
+			const flatOldConsent = raw["dev.autoqa.consent"];
+			const nestedNewConsent = devObj?.autoqaConsent;
+			const flatNewConsent = raw["dev.autoqaConsent"];
+
+			const resolvedConsent =
+				(isAutoqaConsent(nestedNewConsent) ? nestedNewConsent : undefined) ??
+				(isAutoqaConsent(flatNewConsent) ? flatNewConsent : undefined) ??
+				(isAutoqaConsent(nestedOldConsent) ? nestedOldConsent : undefined) ??
+				(isAutoqaConsent(flatOldConsent) ? flatOldConsent : undefined);
+
+			const recoveredAutoqa =
+				typeof nestedAutoqa === "boolean" ? nestedAutoqa : typeof flatAutoqa === "boolean" ? flatAutoqa : undefined;
+
+			if (resolvedConsent !== undefined) {
+				const devRoot = ensureObject("dev");
+				if (!isAutoqaConsent(devRoot.autoqaConsent)) {
+					devRoot.autoqaConsent = resolvedConsent;
+				}
+			}
+
+			// Strip legacy leaf sources (nested + flat dotted).
+			delete raw["dev.autoqa.consent"];
+			delete raw["dev.autoqaConsent"];
+			if (isRecord(raw.dev) && isRecord(raw.dev.autoqa)) {
+				delete raw.dev.autoqa.consent;
+				if (Object.keys(raw.dev.autoqa).length === 0) {
+					delete raw.dev.autoqa;
+				}
+			}
+
+			// Parent must be a boolean or absent — never a leftover object.
+			if (recoveredAutoqa !== undefined) {
+				const devRoot = ensureObject("dev");
+				if (typeof devRoot.autoqa !== "boolean") {
+					devRoot.autoqa = recoveredAutoqa;
+				}
+			} else if (isRecord(raw.dev) && isRecord(raw.dev.autoqa)) {
+				// Irrecoverable collision: object was only a container for the old
+				// consent leaf. Drop it so the schema default (false) applies.
+				delete raw.dev.autoqa;
+			}
+			delete raw["dev.autoqa"];
+			if (isRecord(raw.dev) && Object.keys(raw.dev).length === 0) {
+				delete raw.dev;
+			}
+		}
+
+		// --- todo.reminders.max -> todo.remindersMax ---
+		{
+			const todoObj = isRecord(raw.todo) ? raw.todo : undefined;
+			const nestedReminders = todoObj?.reminders;
+			const flatReminders = raw["todo.reminders"];
+			const nestedOldMax = isRecord(nestedReminders) ? nestedReminders.max : undefined;
+			const flatOldMax = raw["todo.reminders.max"];
+			const nestedNewMax = todoObj?.remindersMax;
+			const flatNewMax = raw["todo.remindersMax"];
+
+			const resolvedMax =
+				(isFiniteNumber(nestedNewMax) ? nestedNewMax : undefined) ??
+				(isFiniteNumber(flatNewMax) ? flatNewMax : undefined) ??
+				(isFiniteNumber(nestedOldMax) ? nestedOldMax : undefined) ??
+				(isFiniteNumber(flatOldMax) ? flatOldMax : undefined);
+
+			const recoveredReminders =
+				typeof nestedReminders === "boolean"
+					? nestedReminders
+					: typeof flatReminders === "boolean"
+						? flatReminders
+						: undefined;
+
+			if (resolvedMax !== undefined) {
+				const todoRoot = ensureObject("todo");
+				if (!isFiniteNumber(todoRoot.remindersMax)) {
+					todoRoot.remindersMax = resolvedMax;
+				}
+			}
+
+			delete raw["todo.reminders.max"];
+			delete raw["todo.remindersMax"];
+			if (isRecord(raw.todo) && isRecord(raw.todo.reminders)) {
+				delete raw.todo.reminders.max;
+				if (Object.keys(raw.todo.reminders).length === 0) {
+					delete raw.todo.reminders;
+				}
+			}
+
+			if (recoveredReminders !== undefined) {
+				const todoRoot = ensureObject("todo");
+				if (typeof todoRoot.reminders !== "boolean") {
+					todoRoot.reminders = recoveredReminders;
+				}
+			} else if (isRecord(raw.todo) && isRecord(raw.todo.reminders)) {
+				// Irrecoverable collision: object was only a container for max.
+				// Drop it so the schema default (true) applies.
+				delete raw.todo.reminders;
+			}
+			delete raw["todo.reminders"];
+			if (isRecord(raw.todo) && Object.keys(raw.todo).length === 0) {
+				delete raw.todo;
+			}
+		}
+
 		// BM25 tool discovery removal: tools.discoveryMode / tools.essentialOverride /
 		// mcp.discoveryMode / mcp.discoveryDefaultServers are gone with no
 		// replacement (`tools.xdev` stays at its own default). Dead keys are
