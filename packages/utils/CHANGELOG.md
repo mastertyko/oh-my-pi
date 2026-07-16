@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Bounded default `ptree.ChildProcess` stderr retention to the existing 32 KiB tail while preserving explicit full capture.
+
 ## [17.0.1] - 2026-07-16
 
 ### Fixed
