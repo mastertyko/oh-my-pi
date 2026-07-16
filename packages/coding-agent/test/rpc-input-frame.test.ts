@@ -278,6 +278,51 @@ describe("RpcInputDispatcher", () => {
 		]);
 	});
 
+	test("session transitions wait for earlier bash while abort_bash still bypasses", async () => {
+		const bashPending = Promise.withResolvers<RpcResponse>();
+		const events: string[] = [];
+		const { deps, outputs } = makeDeps(async command => {
+			events.push(`start:${command.type}`);
+			if (command.type === "bash") {
+				const response = await bashPending.promise;
+				events.push("settle:bash");
+				return response;
+			}
+			if (command.type === "abort_bash") {
+				bashPending.resolve(cancelledBashResponse("bash-1"));
+				return { id: command.id, type: "response", command: "abort_bash", success: true };
+			}
+			if (command.type === "new_session") {
+				return {
+					id: command.id,
+					type: "response",
+					command: "new_session",
+					success: true,
+					data: { cancelled: false },
+				};
+			}
+			throw new Error(`unexpected command type: ${command.type}`);
+		});
+		const dispatcher = new RpcInputDispatcher({ deps });
+
+		dispatcher.dispatch({ id: "bash-1", type: "bash", command: "inert gated command" });
+		await flushMicrotasks();
+		expect(events).toEqual(["start:bash"]);
+
+		dispatcher.dispatch({ id: "session-1", type: "new_session" });
+		await flushMicrotasks();
+		expect(events).toEqual(["start:bash"]);
+
+		dispatcher.dispatch({ id: "abort-1", type: "abort_bash" });
+		await dispatcher.drain();
+		await flushMicrotasks();
+
+		expect(events).toEqual(["start:bash", "start:abort_bash", "settle:bash", "start:new_session"]);
+		const responseCommands = outputs.map(output => (output as RpcResponse).command);
+		expect(responseCommands.indexOf("abort_bash")).toBeLessThan(responseCommands.indexOf("new_session"));
+		expect(responseCommands.indexOf("bash")).toBeLessThan(responseCommands.indexOf("new_session"));
+	});
+
 	test("malformed frames emit a parse error without ending the input reader", () => {
 		const { deps, outputs } = makeDeps(async command => ({
 			id: command.id,

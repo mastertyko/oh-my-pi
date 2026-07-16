@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed RPC session transitions overtaking an in-flight `bash` and recording its result in the replacement session; RPC commands now preserve bash ordering while `abort_bash` remains immediate.
+
 ## [17.0.1] - 2026-07-16
 
 ### Changed

@@ -340,7 +340,7 @@ export function dispatchRpcInputFrame(parsed: unknown, deps: RpcInputFrameDeps):
 	})();
 }
 
-/** Serializes ordinary RPC commands while allowing control frames to dispatch immediately. */
+/** Serializes RPC commands while allowing control frames and `abort_bash` to dispatch immediately. */
 export class RpcInputDispatcher {
 	#tail: Promise<void> = Promise.resolve();
 	#tasks = new Set<Promise<void>>();
@@ -358,8 +358,14 @@ export class RpcInputDispatcher {
 			if (dispatchRpcControlFrame(parsed, this.#deps)) return;
 
 			const command = parsed as RpcCommand;
-			if (command.type === "bash") {
-				dispatchRpcInputFrame(command, this.#deps);
+			if (command.type === "abort_bash") {
+				// Cancellation must overtake the bash it releases. The serialized bash
+				// performs the post-command shutdown check after its response is emitted.
+				const task = this.#dispatchSerialCommand(command, false);
+				this.#tasks.add(task);
+				void task.finally(() => {
+					this.#tasks.delete(task);
+				});
 				return;
 			}
 
@@ -385,15 +391,14 @@ export class RpcInputDispatcher {
 		}
 	}
 
-	async #dispatchSerialCommand(command: RpcCommand): Promise<void> {
+	async #dispatchSerialCommand(command: RpcCommand, runAfterSerialCommand = true): Promise<void> {
 		try {
-			const awaited = dispatchRpcInputFrame(command, this.#deps);
-			if (awaited) await awaited;
+			this.#deps.output(await this.#deps.handleCommand(command));
 		} catch (err: unknown) {
 			const message = err instanceof Error ? err.message : String(err);
 			this.#deps.output(this.#deps.errorResponse(command.id, command.type, message));
 		} finally {
-			await this.#afterSerialCommand?.();
+			if (runAfterSerialCommand) await this.#afterSerialCommand?.();
 		}
 	}
 }
@@ -1340,10 +1345,9 @@ export async function runRpcMode(
 		}
 	};
 
-	// Deferred shutdown (pi.shutdown() from an extension) must not kill the
-	// process while a background-dispatched bash still owes the client its
-	// response frame. The coordinator drains tracked tasks before exiting and
-	// re-checks the request as each task settles.
+	// Deferred shutdown (pi.shutdown() from an extension) runs after the active
+	// serialized command emits its response. The coordinator also drains any
+	// explicitly tracked background input work before exiting.
 	const shutdownCoordinator = new RpcShutdownCoordinator({
 		isShutdownRequested: () => shutdownState.requested,
 		performShutdown: async () => {
@@ -1373,9 +1377,8 @@ export async function runRpcMode(
 		afterSerialCommand: () => shutdownCoordinator.checkShutdownRequested(),
 	});
 
-	// Keep the stdin reader moving: side-channel frames dispatch immediately,
-	// ordinary commands serialize through inputDispatcher, and bash remains
-	// background-dispatched so abort_bash can overtake it.
+	// Keep the stdin reader moving: side-channel frames and `abort_bash` dispatch
+	// immediately; every other command, including `bash`, stays serialized.
 	for await (const parsed of readJsonl(Bun.stdin.stream())) {
 		inputDispatcher.dispatch(parsed);
 	}
