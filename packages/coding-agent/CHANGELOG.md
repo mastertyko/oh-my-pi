@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Fixed RPC session transitions overtaking an in-flight `bash` and recording its result in the replacement session; RPC commands now preserve bash ordering while `abort_bash` remains immediate.
+- Fixed late user-initiated bash results and minimized-output artifacts being recorded in whichever session or branch was active when execution finished; bash now retains its originating transcript across session transitions, while intentionally dropped sessions remain deleted.
 
 ## [17.0.1] - 2026-07-16
 
