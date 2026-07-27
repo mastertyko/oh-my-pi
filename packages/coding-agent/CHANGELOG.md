@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a persistent `/live` response-language setting with automatic language detection, 57 selectable languages, and explicit mid-session switching.
+
 ## [17.1.5] - 2026-07-27
 
 ### Added

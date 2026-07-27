@@ -6,6 +6,7 @@ import { prompt } from "@oh-my-pi/pi-utils";
 import type { AgentSession } from "../session/agent-session";
 import type { AgentSessionEvent } from "../session/agent-session-events";
 import { LIVE_DELEGATION_MESSAGE_TYPE } from "../session/messages";
+import { DEFAULT_LIVE_LANGUAGE, getLiveLanguageName, type LiveLanguage } from "./languages";
 import agentFinalMessageTemplate from "./prompts/agent-final-message.md" with { type: "text" };
 import liveInstructionsTemplate from "./prompts/live-instructions.md" with { type: "text" };
 import {
@@ -54,6 +55,8 @@ export interface LiveSessionControllerOptions {
 	extractAssistantText(message: AssistantMessage): string;
 	/** Realtime output voice, defaulting to sol. */
 	voice?: string;
+	/** Preferred response language, defaulting to automatic detection. */
+	language?: LiveLanguage;
 }
 
 function errorFrom(cause: unknown): Error {
@@ -87,12 +90,22 @@ function currentUser(): { username: string; firstName: string } {
 	return { username, firstName: firstPart ?? "there" };
 }
 
+/** Renders complete realtime instructions for one language preference. */
+export function renderLiveInstructions(language: LiveLanguage = DEFAULT_LIVE_LANGUAGE): string {
+	return prompt.render(liveInstructionsTemplate, {
+		...currentUser(),
+		automaticLanguage: language === DEFAULT_LIVE_LANGUAGE,
+		languageName: getLiveLanguageName(language),
+	});
+}
+
 /** Coordinates the realtime conversational surface with normal AgentSession turns. */
 export class LiveSessionController {
 	readonly #session: AgentSession;
 	readonly #callbacks: LiveSessionCallbacks;
 	readonly #extractAssistantText: (message: AssistantMessage) => string;
 	readonly #voice: string;
+	readonly #language: LiveLanguage;
 
 	#transport: CodexLiveTransport | undefined;
 	#recorder: AudioCapture | undefined;
@@ -121,6 +134,7 @@ export class LiveSessionController {
 		this.#callbacks = options.callbacks;
 		this.#extractAssistantText = options.extractAssistantText;
 		this.#voice = options.voice?.trim() || DEFAULT_LIVE_VOICE;
+		this.#language = options.language ?? DEFAULT_LIVE_LANGUAGE;
 	}
 
 	/** Current realtime call phase. */
@@ -149,8 +163,7 @@ export class LiveSessionController {
 		}
 
 		try {
-			const user = currentUser();
-			const instructions = prompt.render(liveInstructionsTemplate, user);
+			const instructions = renderLiveInstructions(this.#language);
 			const transport = new CodexLiveTransport({
 				authStorage: this.#session.modelRegistry.authStorage,
 				sessionId: this.#session.sessionId,
