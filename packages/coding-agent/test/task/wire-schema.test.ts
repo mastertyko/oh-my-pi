@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { TaskTool, taskSchema } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
-import { getTaskSchema, oneLineLabel } from "@oh-my-pi/pi-coding-agent/task/types";
+import { getTaskSchema } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { type } from "arktype";
 
@@ -10,33 +10,6 @@ import { type } from "arktype";
 // (batch: `{ context, tasks[] }` of the same items). `agent` defaults to the
 // schema's spawn-policy default, and unknown keys sent by stale callers (`role`,
 // `description`) are stripped by the schema's `+: "delete"` — never rejected.
-
-describe("oneLineLabel", () => {
-	it("returns short text unchanged", () => {
-		expect(oneLineLabel("DB migration specialist")).toBe("DB migration specialist");
-	});
-
-	it("collapses control and zero-width characters that \\s alone misses", () => {
-		// U+0085 (NEL) and U+200B (zero-width space) are NOT matched by \s, so a
-		// bare replace(/\s+/) would leak them into a prompt/roster field.
-		const out = oneLineLabel("Auth\u0085flow\u200breviewer");
-		expect(out).toBe("Auth flow reviewer");
-		expect(out).not.toMatch(/[\p{Cc}\p{Cf}]/u);
-	});
-
-	it("respects a minimal cap without a negative-slice blowup", () => {
-		expect(oneLineLabel("abcdef", 1)).toBe("…");
-		expect(oneLineLabel("abcdef", 0)).toBe("…");
-	});
-
-	it("truncates on a code-point boundary without splitting a surrogate pair", () => {
-		// The cut would land mid-emoji at the default cap; the result must stay
-		// well-formed (a lone surrogate makes encodeURIComponent throw).
-		const out = oneLineLabel(`${"a".repeat(78)}😀tail`);
-		expect(out.endsWith("…")).toBe(true);
-		expect(() => encodeURIComponent(out)).not.toThrow();
-	});
-});
 
 /** Narrow a parsed batch payload to its items; fails the test on any other shape. */
 function parsedItems(parsed: unknown): Array<Record<string, unknown>> {

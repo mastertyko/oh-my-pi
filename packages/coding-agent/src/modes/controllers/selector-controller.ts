@@ -440,6 +440,12 @@ export class SelectorController {
 				this.ctx.statusLine.invalidate();
 				this.ctx.updateEditorBorderColor();
 				break;
+			case "assistant.name":
+			case "user.name":
+				void this.ctx.session.refreshBaseSystemPrompt().catch(err => {
+					this.ctx.showError(`Failed to apply personalization: ${err}`);
+				});
+				break;
 			case "personality":
 				void this.ctx.session.refreshBaseSystemPrompt().catch(err => {
 					this.ctx.showError(`Failed to apply personality: ${err}`);

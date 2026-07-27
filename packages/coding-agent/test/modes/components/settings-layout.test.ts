@@ -141,6 +141,15 @@ describe("settings layout", () => {
 		expect(defs[2]?.condition?.()).toBe(true);
 	});
 
+	it("exposes assistant and user names as simple personalization text inputs", () => {
+		const defs = getSettingsForTab("interaction").filter(def => def.group === "Personalization");
+
+		expect(defs).toMatchObject([
+			{ path: "assistant.name", type: "text", label: "Assistant Name" },
+			{ path: "user.name", type: "text", label: "Your Name" },
+		]);
+	});
+
 	it("exposes ask.enabled as a boolean under Available Tools", () => {
 		const def = getSettingsForTab("tools").find(def => def.path === "ask.enabled");
 

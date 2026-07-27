@@ -31,10 +31,11 @@ import { getBundledAgent } from "../task/agents";
 import { type ExecutorOptions, runSubagentFollowUpTurn, runSubprocess } from "../task/executor";
 import { generateTaskName } from "../task/name-generator";
 import { AgentOutputManager } from "../task/output-manager";
-import { type AgentDefinition, type AgentProgress, oneLineLabel, type SingleResult } from "../task/types";
+import type { AgentDefinition, AgentProgress, SingleResult } from "../task/types";
 import type { ToolSession } from "../tools";
 import { formatDuration } from "../tools/render-utils";
 import { ToolError } from "../tools/tool-errors";
+import { oneLineLabel } from "../utils/text";
 import { calculateTokensPerSecond } from "../utils/token-rate";
 
 /** The two worker CLI flavors the director drives. */

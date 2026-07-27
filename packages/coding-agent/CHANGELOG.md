@@ -5,6 +5,7 @@
 ### Added
 
 - Added a persistent `/live` response-language setting with automatic language detection, 57 selectable languages, and explicit mid-session switching.
+- Added optional assistant and user name settings that personalize provider-facing text and `/live` voice prompts while keeping names single-line, bounded, and XML-safe.
 
 ## [17.1.5] - 2026-07-27
 

@@ -10,7 +10,7 @@
  */
 
 import type { AgentSession } from "../session/agent-session";
-import { oneLineLabel } from "../task/types";
+import { oneLineLabel } from "../utils/text";
 
 export const MAIN_AGENT_ID = "Main";
 

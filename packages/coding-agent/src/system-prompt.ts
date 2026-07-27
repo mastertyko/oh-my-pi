@@ -16,6 +16,7 @@ import { type ContextFile, loadCapability, type SystemPrompt as SystemPromptFile
 import { expandAtImports } from "./discovery/at-imports";
 import { loadSkills, type Skill } from "./extensibility/skills";
 import { hasObsidian } from "./internal-urls/vault-protocol";
+import { type AgentPersonalization, renderAgentPersonalization } from "./personalization";
 import activeRepoContextTemplate from "./prompts/system/active-repo-context.md" with { type: "text" };
 import computerSafetyPrompt from "./prompts/system/computer-safety.md" with { type: "text" };
 import customSystemPromptTemplate from "./prompts/system/custom-system-prompt.md" with { type: "text" };
@@ -534,6 +535,8 @@ export interface BuildSystemPromptOptions {
 	includeModelInPrompt?: boolean;
 	/** Personality preset rendered into the default system prompt. "none" omits the block. Default: "default" */
 	personality?: Personality;
+	/** Optional assistant and user names rendered as a separate stable prompt block. */
+	personalization?: AgentPersonalization;
 	/** Whether to include the workspace directory tree in the system prompt. Default: false */
 	includeWorkspaceTree?: boolean;
 	/** Whether Mermaid fenced blocks render as terminal ASCII diagrams. Default: true */
@@ -588,6 +591,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		model,
 		includeModelInPrompt = true,
 		personality = "default",
+		personalization,
 		includeWorkspaceTree = false,
 		renderMermaid = true,
 		xdevTools = [],
@@ -875,6 +879,10 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	};
 	const rendered = prompt.render(resolvedCustomPrompt ? customSystemPromptTemplate : systemPromptTemplate, data);
 	const systemPrompt = [rendered];
+	const personalizationPrompt = renderAgentPersonalization(personalization)?.prompt;
+	if (personalizationPrompt) {
+		systemPrompt.push(personalizationPrompt);
+	}
 	if (toolNames.includes("computer")) {
 		systemPrompt.push(computerSafetyPrompt.trim());
 	}

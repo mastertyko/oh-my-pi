@@ -103,9 +103,6 @@ export interface SubagentLifecyclePayload {
 	detached?: boolean;
 }
 
-/** Display cap for a normalized one-line label (roster line, registry `displayName`, prompt field). */
-export const LABEL_MAX = 80;
-
 // Keep this explicit: ArkType serializes `unknown` as a boolean subschema, which llama.cpp grammars reject.
 const outputSchemaInputSchema = type("object | boolean | string | null");
 // Coarse per-spawn thinking effort; must stay in sync with TASK_EFFORTS in ../thinking.
@@ -307,24 +304,6 @@ export interface TaskParams {
 	context?: string;
 	/** Run in an isolated worktree (flat form; per-item in batch form). */
 	isolated?: boolean;
-}
-
-/**
- * One-line, length-capped label safe for a single roster line, a registry
- * `displayName`, or a system-prompt field. Collapses every run of whitespace
- * AND control/format characters — including U+0085 NEL, ESC/ANSI, and the
- * zero-width separators that `\s` misses — to a single space, then caps length.
- * So untrusted text (a generated task label, a peer activity gist) can neither
- * break the line, inject prompt structure, nor smuggle terminal escapes. Caps at
- * `max` characters (clamped to >= 1; default `LABEL_MAX`), appending an ellipsis when truncated.
- */
-export function oneLineLabel(text: string, max = LABEL_MAX): string {
-	const oneLine = text.replace(/[\p{Cc}\p{Cf}\s]+/gu, " ").trim();
-	const cap = Math.max(1, max);
-	// Count/cut by code point, not UTF-16 code unit, so truncation can never
-	// split an astral character into a lone surrogate.
-	const chars = [...oneLine];
-	return chars.length > cap ? `${chars.slice(0, cap - 1).join("")}…` : oneLine;
 }
 
 /**

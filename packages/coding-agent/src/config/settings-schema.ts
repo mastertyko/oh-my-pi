@@ -124,6 +124,7 @@ export const TAB_GROUPS: Record<SettingTab, readonly string[]> = {
 	appearance: ["Theme", "Status Line", "Display", "Images"],
 	model: ["Thinking", "Sampling", "Prompt", "Retry & Fallback", "Advisor", "Prewalk", "Vision"],
 	interaction: [
+		"Personalization",
 		"Input",
 		"Approvals",
 		"Notifications",
@@ -1613,6 +1614,28 @@ export const SETTINGS_SCHEMA = {
 	// ────────────────────────────────────────────────────────────────────────
 	// Interaction
 	// ────────────────────────────────────────────────────────────────────────
+
+	"assistant.name": {
+		type: "string",
+		default: "",
+		ui: {
+			tab: "interaction",
+			group: "Personalization",
+			label: "Assistant Name",
+			description: "Name the assistant recognizes as its own in text and live voice sessions",
+		},
+	},
+
+	"user.name": {
+		type: "string",
+		default: "",
+		ui: {
+			tab: "interaction",
+			group: "Personalization",
+			label: "Your Name",
+			description: "Your name, used sparingly for natural personalization in text and live voice sessions",
+		},
+	},
 
 	// Conversation flow
 	steeringMode: {

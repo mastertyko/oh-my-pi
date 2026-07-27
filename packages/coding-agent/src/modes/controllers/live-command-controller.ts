@@ -108,6 +108,10 @@ export class LiveCommandController {
 			extractAssistantText: message => this.#ctx.extractAssistantText(message),
 			voice: this.#ctx.settings.get("live.voice"),
 			language: this.#ctx.settings.get("live.language"),
+			personalization: {
+				assistantName: this.#ctx.settings.get("assistant.name"),
+				userName: this.#ctx.settings.get("user.name"),
+			},
 			callbacks: {
 				onPhase: phase => {
 					if (this.#visualizer !== visualizer) return;

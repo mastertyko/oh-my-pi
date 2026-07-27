@@ -139,7 +139,7 @@ Artifacts and side channels:
 - Per-subagent output truncation: `MAX_OUTPUT_BYTES = 500_000` and `MAX_OUTPUT_LINES = 5000` in `packages/coding-agent/src/task/types.ts` (overridable via `PI_TASK_MAX_OUTPUT_BYTES` / `PI_TASK_MAX_OUTPUT_LINES`). Full raw output is still written to `<id>.md`.
 - Progress coalescing: `PROGRESS_COALESCE_MS = 150`; recent-output tail: `RECENT_OUTPUT_TAIL_BYTES = 8 * 1024` (last 8 non-empty lines).
 - Missing-`yield` reminder retries: `MAX_YIELD_RETRIES = 3`; MCP proxy timeout: `MCP_CALL_TIMEOUT_MS = 60_000` — both in `packages/coding-agent/src/task/executor.ts`.
-- Name/label caps: the wire `name` has no schema length cap (prompt text suggests `≤32` chars — guidance only); one-line display text (roster line, registry `displayName`) is normalized by `oneLineLabel(...)` and capped at `LABEL_MAX = 80` chars in `packages/coding-agent/src/task/types.ts`.
+- Name/label caps: the wire `name` has no schema length cap (prompt text suggests `≤32` chars — guidance only); one-line display text (roster line, registry `displayName`) is normalized by `oneLineLabel(...)` in `packages/coding-agent/src/utils/text.ts` and capped by default at 80 Unicode code points, including the truncation ellipsis.
 - Soft request budget (`task.softRequestBudget`) and wall clock (`task.maxRuntimeMs`) apply to every spawn.
 - Recursion depth gate: `task.maxRecursionDepth`; `packages/coding-agent/src/tools/index.ts` hides the `task` tool at or beyond the limit, and `runSubprocess(...)` also strips child `task` access at max depth.
 - Final inline summary preview uses `fullOutputThreshold = 5000` chars in `packages/coding-agent/src/task/index.ts`; `agent://<id>` points to the full artifact.

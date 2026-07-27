@@ -2,7 +2,8 @@ import * as os from "node:os";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { AudioCapture } from "@oh-my-pi/pi-natives";
-import { prompt } from "@oh-my-pi/pi-utils";
+import { escapeXmlText, prompt } from "@oh-my-pi/pi-utils";
+import { type AgentPersonalization, renderAgentPersonalization } from "../personalization";
 import type { AgentSession } from "../session/agent-session";
 import type { AgentSessionEvent } from "../session/agent-session-events";
 import { LIVE_DELEGATION_MESSAGE_TYPE } from "../session/messages";
@@ -57,6 +58,8 @@ export interface LiveSessionControllerOptions {
 	voice?: string;
 	/** Preferred response language, defaulting to automatic detection. */
 	language?: LiveLanguage;
+	/** Optional assistant and user names shared with text-mode prompts. */
+	personalization?: AgentPersonalization;
 }
 
 function errorFrom(cause: unknown): Error {
@@ -91,9 +94,17 @@ function currentUser(): { username: string; firstName: string } {
 }
 
 /** Renders complete realtime instructions for one language preference. */
-export function renderLiveInstructions(language: LiveLanguage = DEFAULT_LIVE_LANGUAGE): string {
+export function renderLiveInstructions(
+	language: LiveLanguage = DEFAULT_LIVE_LANGUAGE,
+	personalization?: AgentPersonalization,
+): string {
+	const current = currentUser();
+	const renderedPersonalization = renderAgentPersonalization(personalization);
 	return prompt.render(liveInstructionsTemplate, {
-		...currentUser(),
+		assistantDisplayName: escapeXmlText(renderedPersonalization?.assistantName ?? "omp Live"),
+		userDisplayName: escapeXmlText(renderedPersonalization?.userName ?? current.firstName),
+		username: escapeXmlText(current.username),
+		personalization: renderedPersonalization?.prompt ?? "",
 		automaticLanguage: language === DEFAULT_LIVE_LANGUAGE,
 		languageName: getLiveLanguageName(language),
 	});
@@ -108,6 +119,7 @@ export class LiveSessionController {
 	readonly #language: LiveLanguage;
 
 	#transport: CodexLiveTransport | undefined;
+	readonly #personalization: AgentPersonalization | undefined;
 	#recorder: AudioCapture | undefined;
 	#unsubscribeSession: (() => void) | undefined;
 	#sendChain: Promise<void> = Promise.resolve();
@@ -135,6 +147,7 @@ export class LiveSessionController {
 		this.#extractAssistantText = options.extractAssistantText;
 		this.#voice = options.voice?.trim() || DEFAULT_LIVE_VOICE;
 		this.#language = options.language ?? DEFAULT_LIVE_LANGUAGE;
+		this.#personalization = options.personalization;
 	}
 
 	/** Current realtime call phase. */
@@ -163,7 +176,7 @@ export class LiveSessionController {
 		}
 
 		try {
-			const instructions = renderLiveInstructions(this.#language);
+			const instructions = renderLiveInstructions(this.#language, this.#personalization);
 			const transport = new CodexLiveTransport({
 				authStorage: this.#session.modelRegistry.authStorage,
 				sessionId: this.#session.sessionId,
