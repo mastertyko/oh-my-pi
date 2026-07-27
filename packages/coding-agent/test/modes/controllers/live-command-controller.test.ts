@@ -65,12 +65,13 @@ describe("LiveCommandController", () => {
 		}
 	});
 
-	it("renders automatic language following for substantive speech and explicit switches", () => {
+	it("renders automatic language following with sticky explicit overrides", () => {
 		const instructions = renderLiveInstructions("auto");
 
 		expect(instructions).toContain("first substantive utterance");
-		expect(instructions).toContain("switch immediately when the user explicitly requests another language");
-		expect(instructions).toContain("substantive utterance in it");
+		expect(instructions).toContain("Until the user explicitly requests a language");
+		expect(instructions).toContain("requested language becomes current until another explicit request");
+		expect(instructions).toContain("regardless of the language the user speaks");
 		expect(instructions).not.toContain("is the preferred response language");
 	});
 
